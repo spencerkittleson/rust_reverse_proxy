@@ -1,0 +1,27 @@
+[package]
+name = "rust_proxy"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rust_proxy"
+path = "src/main.rs"
+
+[lib]
+name = "rust_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.0"
+url = "2.0"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.0", features = ["derive"] }
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["shellapi"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"
