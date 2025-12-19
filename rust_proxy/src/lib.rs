@@ -7,6 +7,9 @@ pub use tokio::sync::Semaphore;
 pub use tokio::time::{timeout, Duration};
 pub use url::Url;
 
+#[cfg(windows)]
+pub mod windows;
+
 pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 
 pub const BUFFER_SIZE: usize = 65536; // Larger buffer for better throughput
