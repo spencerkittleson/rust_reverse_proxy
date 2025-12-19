@@ -5,8 +5,17 @@ use log::{info, warn, debug};
 
 #[cfg(windows)]
 pub fn is_running_as_admin() -> bool {
-    use winapi::um::shellapi::IsUserAnAdmin;
-    unsafe { IsUserAnAdmin() != 0 }
+    use std::process::Command;
+    
+    // Try to run a command that requires admin privileges
+    let output = Command::new("net")
+        .args(&["session"])
+        .output();
+    
+    match output {
+        Ok(result) => result.status.success(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(windows)]
