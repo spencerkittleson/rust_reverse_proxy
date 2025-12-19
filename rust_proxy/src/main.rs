@@ -37,18 +37,35 @@ async fn main() -> Result<(), ProxyError> {
     // Use semaphore to limit concurrent connections
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     
+    // Initialize statistics
+    let stats = Arc::new(ProxyStats::new());
+    let stats_logger = stats.clone();
+    
+    // Start periodic statistics logging task
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(180)); // Log every 3 minutes
+        interval.tick().await; // Skip first immediate tick
+        
+        loop {
+            interval.tick().await;
+            stats_logger.log_stats();
+        }
+    });
+    
     info!("Proxy server starting on {} (max connections: {})", addr, MAX_CONNECTIONS);
     info!("Log level set to: {}", args.log_level);
     info!("Host configured: {}", args.host);
     info!("Port configured: {}", args.port);
+    info!("Statistics logging enabled (every 3 minutes in INFO mode)");
 
     loop {
         let (client_socket, _) = listener.accept().await?;
         let permit = semaphore.clone().acquire_owned().await?;
+        let stats_clone = stats.clone();
         
         tokio::spawn(async move {
             let _permit = permit; // Hold permit until task completes
-            if let Err(e) = handle_client(client_socket).await {
+            if let Err(e) = handle_client(client_socket, stats_clone).await {
                 error!("Error handling client: {}", e);
             }
         });

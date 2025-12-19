@@ -1,7 +1,8 @@
-use rust_proxy::{find_request_end, parse_host_port, bounded_copy, ProxyError, Args};
+use rust_proxy::{find_request_end, parse_host_port, bounded_copy, ProxyStats, ProxyError, Args};
+use std::sync::Arc;
+use std::time::Duration;
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
-use tokio::time::Duration;
 
 #[test]
 fn test_find_request_end() {
@@ -186,4 +187,212 @@ fn test_log_level_parsing() {
     ]).unwrap();
     assert_eq!(args.port, 1234);
     assert_eq!(args.log_level, "info");
+}
+
+// ===== Statistics Tests =====
+
+#[test]
+fn test_proxy_stats_creation() {
+    let stats = ProxyStats::new();
+    
+    // Test initial values
+    assert_eq!(stats.total_connections.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(stats.active_connections.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(stats.http_requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(stats.https_requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(stats.connection_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+    
+    // Test that start time is reasonable (within last second)
+    let uptime = stats.start_time.elapsed();
+    assert!(uptime < Duration::from_secs(1));
+}
+
+#[test]
+fn test_proxy_stats_counters() {
+    let stats = ProxyStats::new();
+    
+    // Test connection counters
+    stats.total_connections.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+    stats.active_connections.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    
+    assert_eq!(stats.total_connections.load(std::sync::atomic::Ordering::Relaxed), 5);
+    assert_eq!(stats.active_connections.load(std::sync::atomic::Ordering::Relaxed), 2);
+    
+    // Test request counters
+    stats.http_requests.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+    stats.https_requests.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+    
+    assert_eq!(stats.http_requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(stats.https_requests.load(std::sync::atomic::Ordering::Relaxed), 7);
+    
+    // Test bytes counter
+    stats.bytes_transferred.fetch_add(1024, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed), 1024);
+    
+    // Test error counter
+    stats.connection_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(stats.connection_errors.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_proxy_stats_log_format() {
+    let stats = ProxyStats::new();
+    
+    // Add some test data
+    stats.total_connections.store(100, std::sync::atomic::Ordering::Relaxed);
+    stats.active_connections.store(5, std::sync::atomic::Ordering::Relaxed);
+    stats.bytes_transferred.store(1048576, std::sync::atomic::Ordering::Relaxed); // 1MB
+    stats.http_requests.store(60, std::sync::atomic::Ordering::Relaxed);
+    stats.https_requests.store(40, std::sync::atomic::Ordering::Relaxed);
+    stats.connection_errors.store(2, std::sync::atomic::Ordering::Relaxed);
+    
+    // Test that log_stats doesn't panic and produces expected output format
+    // We can't easily capture log output in unit tests, but we can ensure it doesn't panic
+    stats.log_stats();
+    
+    // Verify the data is still correct after logging
+    assert_eq!(stats.total_connections.load(std::sync::atomic::Ordering::Relaxed), 100);
+    assert_eq!(stats.active_connections.load(std::sync::atomic::Ordering::Relaxed), 5);
+    assert_eq!(stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed), 1048576);
+}
+
+#[tokio::test]
+async fn test_bounded_copy_with_stats() {
+    use rust_proxy::bounded_copy_with_stats;
+    
+    // Create a pipe to test the function
+    let (mut reader, mut writer) = tokio::io::duplex(64);
+    
+    // Write test data
+    let test_data = b"Hello, world! This is test data for statistics.";
+    writer.write_all(test_data).await.unwrap();
+    drop(writer);
+    
+    // Create stats tracker
+    let stats = Arc::new(ProxyStats::new());
+    
+    // Read back using bounded_copy_with_stats
+    let mut output = Vec::new();
+    let result: Result<(), ProxyError> = bounded_copy_with_stats(
+        &mut reader, 
+        &mut output, 
+        1024, 
+        Duration::from_secs(1),
+        Some("src"),
+        Some("dst"),
+        "test",
+        stats.clone()
+    ).await;
+    
+    // Verify success
+    assert!(result.is_ok());
+    assert_eq!(output, test_data);
+    
+    // Verify statistics were updated
+    let bytes_transferred = stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(bytes_transferred, test_data.len() as u64);
+}
+
+#[tokio::test]
+async fn test_bounded_copy_with_stats_size_limit() {
+    use rust_proxy::bounded_copy_with_stats;
+    
+    let (mut reader, mut writer) = tokio::io::duplex(64);
+    
+    // Write data that exceeds limit
+    let test_data = b"This is a very long string that exceeds the size limit for testing purposes";
+    writer.write_all(test_data).await.unwrap();
+    drop(writer);
+    
+    let stats = Arc::new(ProxyStats::new());
+    
+    // Read with small limit
+    let mut output = Vec::new();
+    let result: Result<(), ProxyError> = bounded_copy_with_stats(
+        &mut reader, 
+        &mut output, 
+        10, 
+        Duration::from_secs(1),
+        None,
+        None,
+        "test",
+        stats.clone()
+    ).await;
+    
+    // Should fail due to size limit
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("size limit exceeded"));
+    
+    // Some bytes should have been tracked before hitting limit
+    let bytes_transferred = stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(bytes_transferred > 0);
+    assert!(bytes_transferred <= 10);
+}
+
+#[tokio::test]
+async fn test_bounded_copy_with_stats_timeout() {
+    use rust_proxy::bounded_copy_with_stats;
+    
+    let (reader, writer) = tokio::io::duplex(64);
+    let mut output = Vec::new();
+    
+    let stats = Arc::new(ProxyStats::new());
+    
+    // Don't write anything to simulate timeout scenario
+    drop(writer);
+    
+    let result: Result<(), ProxyError> = bounded_copy_with_stats(
+        reader, 
+        &mut output, 
+        1024, 
+        Duration::from_millis(10), // Very short timeout
+        None,
+        None,
+        "timeout_test",
+        stats.clone()
+    ).await;
+    
+    // Should not fail due to timeout since we dropped the writer (EOF)
+    assert!(result.is_ok());
+    
+    // No bytes should have been transferred
+    let bytes_transferred = stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(bytes_transferred, 0);
+}
+
+#[test]
+fn test_stats_concurrent_access() {
+    use std::thread;
+    
+    let stats = Arc::new(ProxyStats::new());
+    let mut handles = vec![];
+    
+    // Spawn multiple threads to update statistics concurrently
+    for i in 0..10 {
+        let stats_clone = stats.clone();
+        let handle = thread::spawn(move || {
+            for j in 0..100 {
+                stats_clone.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats_clone.bytes_transferred.fetch_add((i * 100 + j) as u64, std::sync::atomic::Ordering::Relaxed);
+                stats_clone.http_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats_clone.https_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    // Verify final counts
+    assert_eq!(stats.total_connections.load(std::sync::atomic::Ordering::Relaxed), 1000);
+    assert_eq!(stats.http_requests.load(std::sync::atomic::Ordering::Relaxed), 1000);
+    assert_eq!(stats.https_requests.load(std::sync::atomic::Ordering::Relaxed), 1000);
+    
+    // Bytes should be sum of all additions
+    let expected_bytes: u64 = (0..10).flat_map(|i| (0..100).map(move |j| (i * 100 + j) as u64)).sum();
+    assert_eq!(stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed), expected_bytes);
 }
