@@ -93,26 +93,24 @@ try {{
     }} catch {{ Write-Host "Firewall setup failed" }}
 }}
 
-# Power settings - use a single elevated command to minimize prompts
+# Power settings - try non-elevated first, only elevate if necessary
 try {{
-    # Create a temporary script to run all power commands at once
-    $powerScript = @"
-powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-powercfg /setactive SCHEME_CURRENT
-"@
-    
-    # Run power commands in a single elevated process
-    Start-Process cmd.exe -ArgumentList "/c", $powerScript -Verb RunAs -Wait -WindowStyle Hidden
-    Write-Host "Power settings configured"
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+    powercfg /setactive SCHEME_CURRENT 2>$null
+    Write-Host "Power settings configured (non-elevated)"
 }} catch {{ 
-    # Fallback: try non-elevated power settings (may work for some users)
-    try {{
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
-        powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
-        powercfg /setactive SCHEME_CURRENT 2>$null
-        Write-Host "Power settings configured (non-elevated)"
-    }} catch {{ Write-Host "Power configuration failed" }}
+    if ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator") {{
+        # Only elevate if we're already admin (no UAC prompt)
+        try {{
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+            powercfg /setactive SCHEME_CURRENT
+            Write-Host "Power settings configured (elevated)"
+        }} catch {{ Write-Host "Power configuration failed" }}
+    }} else {{
+        Write-Host "Power settings require admin privileges - skipping"
+    }}
 }}
 
 Write-Host "Windows environment setup completed"
