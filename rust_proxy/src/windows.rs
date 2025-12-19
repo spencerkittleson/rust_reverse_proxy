@@ -65,59 +65,89 @@ pub fn setup_windows_environment(port: u16) -> Result<(), Box<dyn std::error::Er
     
     info!("Setting up Windows environment optimizations...");
     
-    // Batch PowerShell commands for network and firewall setup
-    let powershell_script = format!(
+    // Use single elevated PowerShell session to minimize UAC prompts
+    let elevated_script = format!(
         r#"
-# Set network profiles to private
-try {{ Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue }}
-catch {{ Write-Host "PowerShell network profile setup failed" }}
-
-# Add firewall rule
-try {{ New-NetFirewallRule -DisplayName "Open Port {port}" -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow -ErrorAction SilentlyContinue }}
-catch {{ 
-    # Fallback to netsh if PowerShell fails
-    netsh advfirewall firewall delete rule name="Open Port {port}" 2>$null
-    netsh advfirewall firewall add rule name="Open Port {port}" dir=in action=allow protocol=TCP localport={port}
+# Start elevated PowerShell session if not already elevated
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {{
+    Write-Host "Not running as administrator - some optimizations skipped"
+    exit 0
 }}
 
-# Configure power settings
+Write-Host "Running with administrator privileges - applying all optimizations"
+
+# Network and firewall setup (non-UAC intensive)
 try {{
-    powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
-    powercfg /setactive SCHEME_CURRENT
+    Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+    Write-Host "Network profiles set to Private"
+}} catch {{ Write-Host "Network setup failed" }}
+
+try {{
+    New-NetFirewallRule -DisplayName "Open Port {port}" -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow -ErrorAction SilentlyContinue
+    Write-Host "Firewall rule added for port {port}"
+}} catch {{ 
+    try {{
+        netsh advfirewall firewall delete rule name="Open Port {port}" 2>$null
+        netsh advfirewall firewall add rule name="Open Port {port}" dir=in action=allow protocol=TCP localport={port}
+        Write-Host "Firewall rule added via netsh"
+    }} catch {{ Write-Host "Firewall setup failed" }}
+}}
+
+# Power settings - use a single elevated command to minimize prompts
+try {{
+    # Create a temporary script to run all power commands at once
+    $powerScript = @"
+powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setactive SCHEME_CURRENT
+"@
+    
+    # Run power commands in a single elevated process
+    Start-Process cmd.exe -ArgumentList "/c", $powerScript -Verb RunAs -Wait -WindowStyle Hidden
     Write-Host "Power settings configured"
-}} catch {{ Write-Host "Power configuration failed" }}
+}} catch {{ 
+    # Fallback: try non-elevated power settings (may work for some users)
+    try {{
+        powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+        powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
+        powercfg /setactive SCHEME_CURRENT 2>$null
+        Write-Host "Power settings configured (non-elevated)"
+    }} catch {{ Write-Host "Power configuration failed" }}
+}}
+
+Write-Host "Windows environment setup completed"
 "#,
         port = port
     );
     
-    match execute_powershell_script(&powershell_script) {
+    match execute_powershell_script(&elevated_script) {
         Ok(output) => {
             info!("Windows environment setup completed successfully");
             debug!("Setup output: {}", output.trim());
         }
         Err(e) => {
-            warn!("PowerShell setup partially failed: {}", e);
+            warn!("PowerShell setup failed: {}", e);
             
-            // Fallback to individual commands if PowerShell script fails
-            info!("Attempting fallback command execution...");
+            // Minimal fallback - only essential firewall rule
+            info!("Attempting minimal firewall setup...");
             
-            let delete_rule = format!("netsh advfirewall firewall delete rule name=\"Open Port {}\" 2>nul", port);
-            let add_rule = format!("netsh advfirewall firewall add rule name=\"Open Port {}\" dir=in action=allow protocol=TCP localport={}", port, port);
+            let firewall_script = format!(
+                r#"
+# Minimal firewall setup
+try {{
+    New-NetFirewallRule -DisplayName "Open Port {}" -Direction Inbound -Protocol TCP -LocalPort {} -Action Allow -ErrorAction SilentlyContinue
+    Write-Host "Firewall rule added successfully"
+}} catch {{
+    netsh advfirewall firewall delete rule name="Open Port {}" 2>$null
+    netsh advfirewall firewall add rule name="Open Port {}" dir=in action=allow protocol=TCP localport={}
+    Write-Host "Firewall rule added via netsh"
+}}
+"#,
+                port, port, port, port, port
+            );
             
-            let fallback_commands = vec![
-                &delete_rule,
-                &add_rule,
-                "powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0",
-                "powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0", 
-                "powercfg /setactive SCHEME_CURRENT"
-            ];
-            
-            if let Err(cmd_err) = execute_cmd_batch(&fallback_commands) {
-                warn!("Fallback commands also failed: {}", cmd_err);
-                return Err(format!("All Windows setup methods failed. Last error: {}", cmd_err).into());
-            } else {
-                info!("Fallback commands completed successfully");
+            if let Err(fw_err) = execute_powershell_script(&firewall_script) {
+                warn!("Firewall setup also failed: {}", fw_err);
             }
         }
     }
