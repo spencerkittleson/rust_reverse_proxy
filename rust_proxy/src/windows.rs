@@ -58,65 +58,98 @@ pub fn execute_cmd_batch(commands: &[&str]) -> Result<(), Box<dyn std::error::Er
 
 #[cfg(windows)]
 pub fn setup_windows_environment(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Setting up Windows environment optimizations (UAC-free mode)...");
-    
-    // Check admin status without triggering UAC
-    let is_admin = is_running_as_admin();
-    if !is_admin {
-        info!("Running without administrator privileges. Only basic optimizations will be applied.");
-    } else {
-        info!("Running with administrator privileges.");
+    if !is_running_as_admin() {
+        warn!("Not running as administrator. Some Windows optimizations may be skipped.");
+        info!("For full functionality, run as administrator or enable specific UAC prompts.");
     }
     
-    // Basic network profile setup (UAC-free)
-    let network_script = format!(
+    info!("Setting up Windows environment optimizations...");
+    
+    // Use single elevated PowerShell session to minimize UAC prompts
+    let elevated_script = format!(
         r#"
-# Network profile setup (non-elevated)
+# Start elevated PowerShell session if not already elevated
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {{
+    Write-Host "Not running as administrator - some optimizations skipped"
+    exit 0
+}}
+
+Write-Host "Running with administrator privileges - applying all optimizations"
+
+# Network and firewall setup (non-UAC intensive)
 try {{
     Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
     Write-Host "Network profiles set to Private"
 }} catch {{ Write-Host "Network setup failed" }}
-"#,
-    );
-    
-    // Firewall setup with netsh (less likely to trigger UAC than New-NetFirewallRule)
-    let firewall_script = format!(
-        r#"
-# Firewall setup using netsh (UAC-free approach)
+
 try {{
-    netsh advfirewall firewall delete rule name="Open Port {}" 2>$null
-    netsh advfirewall firewall add rule name="Open Port {}" dir=in action=allow protocol=TCP localport={}
-    Write-Host "Firewall rule added via netsh for port {}"
-}} catch {{ Write-Host "Firewall setup failed" }}
-"#,
-        port, port, port, port
-    );
-    
-    // Power settings (non-elevated only)
-    let power_script = r#"
-# Power settings (non-elevated only)
-try {
+    New-NetFirewallRule -DisplayName "Open Port {port}" -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow -ErrorAction SilentlyContinue
+    Write-Host "Firewall rule added for port {port}"
+}} catch {{ 
+    try {{
+        netsh advfirewall firewall delete rule name="Open Port {port}" 2>$null
+        netsh advfirewall firewall add rule name="Open Port {port}" dir=in action=allow protocol=TCP localport={port}
+        Write-Host "Firewall rule added via netsh"
+    }} catch {{ Write-Host "Firewall setup failed" }}
+}}
+
+# Power settings - try non-elevated first, only elevate if necessary
+try {{
     powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
     powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
     powercfg /setactive SCHEME_CURRENT 2>$null
     Write-Host "Power settings configured (non-elevated)"
-} catch { Write-Host "Power configuration requires admin privileges - skipping" }
-"#;
+}} catch {{ 
+    if ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator") {{
+        # Only elevate if we're already admin (no UAC prompt)
+        try {{
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+            powercfg /setactive SCHEME_CURRENT
+            Write-Host "Power settings configured (elevated)"
+        }} catch {{ Write-Host "Power configuration failed" }}
+    }} else {{
+        Write-Host "Power settings require admin privileges - skipping"
+    }}
+}}
+
+Write-Host "Windows environment setup completed"
+"#,
+        port = port
+    );
     
-    // Execute all scripts without any elevation attempts
-    if let Err(e) = execute_powershell_script(&network_script) {
-        debug!("Network setup failed: {}", e);
+    match execute_powershell_script(&elevated_script) {
+        Ok(output) => {
+            info!("Windows environment setup completed successfully");
+            debug!("Setup output: {}", output.trim());
+        }
+        Err(e) => {
+            warn!("PowerShell setup failed: {}", e);
+            
+            // Minimal fallback - only essential firewall rule
+            info!("Attempting minimal firewall setup...");
+            
+            let firewall_script = format!(
+                r#"
+# Minimal firewall setup
+try {{
+    New-NetFirewallRule -DisplayName "Open Port {}" -Direction Inbound -Protocol TCP -LocalPort {} -Action Allow -ErrorAction SilentlyContinue
+    Write-Host "Firewall rule added successfully"
+}} catch {{
+    netsh advfirewall firewall delete rule name="Open Port {}" 2>$null
+    netsh advfirewall firewall add rule name="Open Port {}" dir=in action=allow protocol=TCP localport={}
+    Write-Host "Firewall rule added via netsh"
+}}
+"#,
+                port, port, port, port, port
+            );
+            
+            if let Err(fw_err) = execute_powershell_script(&firewall_script) {
+                warn!("Firewall setup also failed: {}", fw_err);
+            }
+        }
     }
     
-    if let Err(e) = execute_powershell_script(&firewall_script) {
-        debug!("Firewall setup failed: {}", e);
-    }
-    
-    if let Err(e) = execute_powershell_script(power_script) {
-        debug!("Power setup failed: {}", e);
-    }
-    
-    info!("Windows environment setup completed (UAC-free)");
     Ok(())
 }
 
