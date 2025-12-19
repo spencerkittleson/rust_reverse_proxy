@@ -102,9 +102,12 @@ try {{
             // Fallback to individual commands if PowerShell script fails
             info!("Attempting fallback command execution...");
             
+            let delete_rule = format!("netsh advfirewall firewall delete rule name=\"Open Port {}\" 2>nul", port);
+            let add_rule = format!("netsh advfirewall firewall add rule name=\"Open Port {}\" dir=in action=allow protocol=TCP localport={}", port, port);
+            
             let fallback_commands = vec![
-                &format!("netsh advfirewall firewall delete rule name=\"Open Port {}\" 2>nul", port),
-                &format!("netsh advfirewall firewall add rule name=\"Open Port {}\" dir=in action=allow protocol=TCP localport={}", port, port),
+                &delete_rule,
+                &add_rule,
                 "powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0",
                 "powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0", 
                 "powercfg /setactive SCHEME_CURRENT"
