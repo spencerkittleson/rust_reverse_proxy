@@ -41,17 +41,19 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build binary
+        working-directory: ./rust_proxy
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (Unix)
         if: matrix.os != 'windows-latest'
+        working-directory: ./rust_proxy
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: rust_proxy/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
   release:
     name: Create GitHub Release

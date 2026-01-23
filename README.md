@@ -1,4 +1,4 @@
-# Rust Proxy Server
+# Rust Forward Transparent Proxy Server
 
 A high-performance, configurable HTTP/HTTPS proxy server written in Rust with advanced SSL/TLS intelligence and Windows integration.
 
@@ -7,33 +7,48 @@ A high-performance, configurable HTTP/HTTPS proxy server written in Rust with ad
 - **HTTP and HTTPS Proxy Support**: Handles both HTTP requests and HTTPS CONNECT tunnels
 - **Advanced SSL/TLS Intelligence**: Sophisticated certificate error detection with 25+ error patterns and VPN-aware context
 - **Windows Integration**: Automatic firewall configuration, network profile management, and power optimization
+- **Cross-Platform Binaries**: Pre-built releases for Windows x64, Linux x64, macOS x64/arm64
 - **Configurable Network Settings**: Customizable host and port with connection limiting
 - **Comprehensive Logging**: Configurable log levels (debug, info, warn, error) with detailed diagnostics
 - **Performance Optimized**: 64KB buffers, connection limits (10,000), timeouts, and size restrictions (1GB)
 - **Robust Error Handling**: Intelligent SSL error analysis with actionable recommendations
 - **Async Architecture**: Built on tokio for high-performance concurrent connections
+- **Automated Releases**: GitHub Actions workflow for automated cross-platform builds and releases
 
 ## Quick Start
 
-`cd rust_proxy`
+### Option 1: Download Pre-built Binary (Recommended)
 
-### Build
+Download the latest release from GitHub for your platform:
+
+**Windows x64**: `rust_proxy-windows-x64.exe`
+**Linux x64**: `rust_proxy-linux-x64`  
+**macOS x64**: `rust_proxy-macos-x64`
+**macOS ARM64**: `rust_proxy-macos-arm64`
 
 ```bash
-cargo build --release
-```
+# Download and run (Windows example)
+wget https://github.com/spencerkittleson/rust_reverse_proxy/releases/latest/download/rust_proxy-windows-x64.exe
+./rust_proxy-windows-x64.exe
 
-### Run
-
-```bash
 # Default settings (0.0.0.0:3129, info level logging)
-./target/release/rust_proxy
+rust_proxy-windows-x64.exe
 
 # Custom configuration
-./target/release/rust_proxy --host 127.0.0.1 --port 8080 --log-level debug
+rust_proxy-windows-x64.exe --host 127.0.0.1 --port 8080 --log-level debug
 
 # Short flags
-./target/release/rust_proxy -h 127.0.0.1 -p 8080 -l debug
+rust_proxy-windows-x64.exe -h 127.0.0.1 -p 8080 -l debug
+```
+
+### Option 2: Build from Source
+
+```bash
+cd rust_proxy
+cargo build --release
+
+# Run binary
+./target/release/rust_proxy
 ```
 
 ### Options
@@ -321,6 +336,34 @@ RUST_LOG=debug ./target/release/rust_proxy 2>&1 | grep -E "(INFO|WARN|ERROR)"
 # Monitor connection lifecycle
 RUST_LOG=debug ./target/release/rust_proxy 2>&1 | grep -E "(connection|tunnel|proxy)"
 ```
+
+## Releases
+
+### Automated Binary Releases
+
+This project uses GitHub Actions to automatically build and release cross-platform binaries when version tags are pushed.
+
+**Supported Platforms:**
+- Windows x64 (`rust_proxy-windows-x64.exe`)
+- Linux x64 (`rust_proxy-linux-x64`)
+- macOS x64 (`rust_proxy-macos-x64`)
+- macOS ARM64 (`rust_proxy-macos-arm64`)
+
+**Creating a Release:**
+```bash
+# Tag and push to trigger automated release
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This will:
+1. Build binaries for all supported platforms
+2. Create a GitHub release with all binary attachments
+3. Generate release notes automatically
+
+### Downloading Releases
+
+Visit the [Releases page](https://github.com/spencerkittleson/rust_reverse_proxy/releases) to download the latest binary for your platform.
 
 ## License
 
