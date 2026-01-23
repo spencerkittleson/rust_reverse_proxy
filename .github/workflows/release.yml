@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: rust_proxy-linux-x64
+            artifact_name: rust_proxy
             asset_name: rust_proxy-linux-x64
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
@@ -24,11 +24,11 @@ jobs:
             asset_name: rust_proxy-windows-x64.exe
             target: x86_64-pc-windows-msvc
           - os: macos-latest
-            artifact_name: rust_proxy-macos-x64
+            artifact_name: rust_proxy
             asset_name: rust_proxy-macos-x64
             target: x86_64-apple-darwin
           - os: macos-latest
-            artifact_name: rust_proxy-macos-arm64
+            artifact_name: rust_proxy
             asset_name: rust_proxy-macos-arm64
             target: aarch64-apple-darwin
 
@@ -47,13 +47,20 @@ jobs:
       - name: Strip binary (Unix)
         if: matrix.os != 'windows-latest'
         working-directory: ./rust_proxy
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: strip target/${{ matrix.target }}/release/rust_proxy
+
+      - name: Rename binary (Unix)
+        if: matrix.os != 'windows-latest'
+        working-directory: ./rust_proxy/target/${{ matrix.target }}/release
+        run: mv rust_proxy ${{ matrix.asset_name }}
+
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: rust_proxy/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: rust_proxy/target/${{ matrix.target }}/release/${{ matrix.asset_name }}
 
   release:
     name: Create GitHub Release
@@ -78,7 +85,7 @@ jobs:
         with:
           files: |
             artifacts/rust_proxy-linux-x64/rust_proxy-linux-x64
-            artifacts/rust_proxy-windows-x64.exe/rust_proxy.exe
+            artifacts/rust_proxy-windows-x64.exe/rust_proxy-windows-x64.exe
             artifacts/rust_proxy-macos-x64/rust_proxy-macos-x64
             artifacts/rust_proxy-macos-arm64/rust_proxy-macos-arm64
           generate_release_notes: true
