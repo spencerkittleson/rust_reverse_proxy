@@ -54,7 +54,10 @@ jobs:
         working-directory: ./rust_proxy/target/${{ matrix.target }}/release
         run: mv rust_proxy ${{ matrix.asset_name }}
 
-
+      - name: Rename binary (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: ./rust_proxy/target/${{ matrix.target }}/release
+        run: mv rust_proxy.exe ${{ matrix.asset_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
