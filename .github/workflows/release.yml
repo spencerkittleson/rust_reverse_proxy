@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: rust_proxy
+            artifact_name: rust_proxy-linux-x64
             asset_name: rust_proxy-linux-x64
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
@@ -24,11 +24,11 @@ jobs:
             asset_name: rust_proxy-windows-x64.exe
             target: x86_64-pc-windows-msvc
           - os: macos-latest
-            artifact_name: rust_proxy
+            artifact_name: rust_proxy-macos-x64
             asset_name: rust_proxy-macos-x64
             target: x86_64-apple-darwin
           - os: macos-latest
-            artifact_name: rust_proxy
+            artifact_name: rust_proxy-macos-arm64
             asset_name: rust_proxy-macos-arm64
             target: aarch64-apple-darwin
 
@@ -77,10 +77,10 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/rust_proxy-linux-x64/rust_proxy
+            artifacts/rust_proxy-linux-x64/rust_proxy-linux-x64
             artifacts/rust_proxy-windows-x64.exe/rust_proxy.exe
-            artifacts/rust_proxy-macos-x64/rust_proxy
-            artifacts/rust_proxy-macos-arm64/rust_proxy
+            artifacts/rust_proxy-macos-x64/rust_proxy-macos-x64
+            artifacts/rust_proxy-macos-arm64/rust_proxy-macos-arm64
           generate_release_notes: true
           draft: false
           prerelease: false

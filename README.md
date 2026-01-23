@@ -21,24 +21,34 @@ A high-performance, configurable HTTP/HTTPS proxy server written in Rust with ad
 
 Download the latest release from GitHub for your platform:
 
-**Windows x64**: `rust_proxy-windows-x64.exe`
-**Linux x64**: `rust_proxy-linux-x64`  
-**macOS x64**: `rust_proxy-macos-x64`
-**macOS ARM64**: `rust_proxy-macos-arm64`
+**Windows x64**: `rust_proxy-windows-x64.exe` (downloads as `rust_proxy.exe`)
+**Linux x64**: `rust_proxy-linux-x64` (downloads as `rust_proxy-linux-x64`)  
+**macOS x64**: `rust_proxy-macos-x64` (downloads as `rust_proxy-macos-x64`)
+**macOS ARM64**: `rust_proxy-macos-arm64` (downloads as `rust_proxy-macos-arm64`)
 
 ```bash
 # Download and run (Windows example)
 wget https://github.com/spencerkittleson/rust_reverse_proxy/releases/latest/download/rust_proxy-windows-x64.exe
-./rust_proxy-windows-x64.exe
+./rust_proxy.exe
+
+# Linux x64 example
+wget https://github.com/spencerkittleson/rust_reverse_proxy/releases/latest/download/rust_proxy-linux-x64
+chmod +x rust_proxy-linux-x64
+./rust_proxy-linux-x64
+
+# macOS x64 example
+wget https://github.com/spencerkittleson/rust_reverse_proxy/releases/latest/download/rust_proxy-macos-x64
+chmod +x rust_proxy-macos-x64
+./rust_proxy-macos-x64
 
 # Default settings (0.0.0.0:3129, info level logging)
-rust_proxy-windows-x64.exe
+rust_proxy.exe
 
 # Custom configuration
-rust_proxy-windows-x64.exe --host 127.0.0.1 --port 8080 --log-level debug
+rust_proxy.exe --host 127.0.0.1 --port 8080 --log-level debug
 
 # Short flags
-rust_proxy-windows-x64.exe -h 127.0.0.1 -p 8080 -l debug
+rust_proxy.exe -h 127.0.0.1 -p 8080 -l debug
 ```
 
 ### Option 2: Build from Source
@@ -344,10 +354,10 @@ RUST_LOG=debug ./target/release/rust_proxy 2>&1 | grep -E "(connection|tunnel|pr
 This project uses GitHub Actions to automatically build and release cross-platform binaries when version tags are pushed.
 
 **Supported Platforms:**
-- Windows x64 (`rust_proxy-windows-x64.exe`)
-- Linux x64 (`rust_proxy-linux-x64`)
-- macOS x64 (`rust_proxy-macos-x64`)
-- macOS ARM64 (`rust_proxy-macos-arm64`)
+- Windows x64 (`rust_proxy-windows-x64.exe` → downloads as `rust_proxy.exe`)
+- Linux x64 (`rust_proxy-linux-x64` → downloads as `rust_proxy-linux-x64`)
+- macOS x64 (`rust_proxy-macos-x64` → downloads as `rust_proxy-macos-x64`)
+- macOS ARM64 (`rust_proxy-macos-arm64` → downloads as `rust_proxy-macos-arm64`)
 
 **Creating a Release:**
 ```bash
