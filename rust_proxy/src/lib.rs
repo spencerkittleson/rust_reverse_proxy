@@ -28,8 +28,15 @@ pub struct ProxyStats {
     pub bytes_transferred: AtomicU64,
     pub http_requests: AtomicU64,
     pub https_requests: AtomicU64,
+    pub socks_requests: AtomicU64,
     pub connection_errors: AtomicU64,
     pub start_time: Instant,
+}
+
+impl Default for ProxyStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProxyStats {
@@ -40,6 +47,7 @@ impl ProxyStats {
             bytes_transferred: AtomicU64::new(0),
             http_requests: AtomicU64::new(0),
             https_requests: AtomicU64::new(0),
+            socks_requests: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             start_time: Instant::now(),
         }
@@ -52,6 +60,7 @@ impl ProxyStats {
         let bytes = self.bytes_transferred.load(Ordering::Relaxed);
         let http = self.http_requests.load(Ordering::Relaxed);
         let https = self.https_requests.load(Ordering::Relaxed);
+        let socks = self.socks_requests.load(Ordering::Relaxed);
         let errors = self.connection_errors.load(Ordering::Relaxed);
 
         info!("📊 Proxy Statistics:");
@@ -61,6 +70,7 @@ impl ProxyStats {
         info!("   Bytes Transferred: {} ({:.2} MB)", bytes, bytes as f64 / 1_048_576.0);
         info!("   HTTP Requests: {}", http);
         info!("   HTTPS Requests: {}", https);
+        info!("   SOCKS5 Requests: {}", socks);
         info!("   Connection Errors: {}", errors);
     }
 }
@@ -171,7 +181,7 @@ fn analyze_ssl_error(host: &str, port: u16, error: &std::io::Error) {
     }
 }
 
-pub async fn handle_client(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+pub async fn handle_client(client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
     // Configure socket options for better performance
     client_socket.set_nodelay(true)?;
 
@@ -180,6 +190,26 @@ pub async fn handle_client(mut client_socket: TcpStream, stats: Arc<ProxyStats>)
     stats.active_connections.fetch_add(1, Ordering::Relaxed);
     debug!("Handling client connection from: {}", client_addr);
 
+    // Peek the first byte to detect SOCKS5 (0x05) vs HTTP
+    let mut peek_buf = [0u8; 1];
+    let peeked = timeout(CONNECT_TIMEOUT, client_socket.peek(&mut peek_buf)).await??;
+    if peeked == 0 {
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    let result = if peek_buf[0] == 0x05 {
+        handle_socks5(client_socket, stats.clone()).await
+    } else {
+        handle_http(client_socket, stats.clone()).await
+    };
+
+    // Cleanup: decrement active connections counter
+    stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    result
+}
+
+async fn handle_http(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
     let mut buffer = vec![0; BUFFER_SIZE];
     let bytes_read = timeout(CONNECT_TIMEOUT, client_socket.read(&mut buffer)).await??;
 
@@ -264,8 +294,124 @@ pub async fn handle_client(mut client_socket: TcpStream, stats: Arc<ProxyStats>)
         }
     }
 
-    // Cleanup: decrement active connections counter
-    stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    Ok(())
+}
+
+// SOCKS5 server implementation (RFC 1928) — no-auth, CONNECT only.
+async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+    // --- Method negotiation ---
+    // Client: VER | NMETHODS | METHODS...
+    let mut header = [0u8; 2];
+    timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut header)).await??;
+    if header[0] != 0x05 {
+        return Err("Invalid SOCKS version".into());
+    }
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    if nmethods > 0 {
+        timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut methods)).await??;
+    }
+
+    // We only support "no authentication" (0x00).
+    if !methods.contains(&0x00) {
+        // 0xFF = NO ACCEPTABLE METHODS
+        client_socket.write_all(&[0x05, 0xFF]).await?;
+        warn!("SOCKS5 client offered no acceptable auth methods");
+        return Ok(());
+    }
+    client_socket.write_all(&[0x05, 0x00]).await?;
+
+    // --- Request ---
+    // VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
+    let mut req_head = [0u8; 4];
+    timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut req_head)).await??;
+    if req_head[0] != 0x05 {
+        return Err("Invalid SOCKS version in request".into());
+    }
+    let cmd = req_head[1];
+    let atyp = req_head[3];
+
+    // Reply helper: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
+    // We always reply with IPv4 0.0.0.0:0 for BND.
+    async fn send_reply(sock: &mut TcpStream, rep: u8) -> Result<(), ProxyError> {
+        let buf = [0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        sock.write_all(&buf).await?;
+        Ok(())
+    }
+
+    if cmd != 0x01 {
+        // 0x07 = Command not supported
+        send_reply(&mut client_socket, 0x07).await?;
+        warn!("SOCKS5 unsupported command: {}", cmd);
+        return Ok(());
+    }
+
+    // Parse destination address
+    let host: String = match atyp {
+        0x01 => {
+            // IPv4
+            let mut addr = [0u8; 4];
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut addr)).await??;
+            std::net::Ipv4Addr::from(addr).to_string()
+        }
+        0x03 => {
+            // Domain name: 1-byte length, then name
+            let mut len_buf = [0u8; 1];
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut len_buf)).await??;
+            let len = len_buf[0] as usize;
+            let mut name = vec![0u8; len];
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut name)).await??;
+            String::from_utf8(name).map_err(|_| "Invalid SOCKS5 domain name")?
+        }
+        0x04 => {
+            // IPv6
+            let mut addr = [0u8; 16];
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut addr)).await??;
+            std::net::Ipv6Addr::from(addr).to_string()
+        }
+        other => {
+            // 0x08 = Address type not supported
+            send_reply(&mut client_socket, 0x08).await?;
+            warn!("SOCKS5 unsupported address type: {}", other);
+            return Ok(());
+        }
+    };
+
+    let mut port_buf = [0u8; 2];
+    timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut port_buf)).await??;
+    let port = u16::from_be_bytes(port_buf);
+
+    stats.socks_requests.fetch_add(1, Ordering::Relaxed);
+    info!("SOCKS5 CONNECT request to {}:{}", host, port);
+
+    match timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
+        Ok(Ok(remote)) => {
+            debug!("SOCKS5 connected to {}:{}", host, port);
+            // 0x00 = succeeded
+            send_reply(&mut client_socket, 0x00).await?;
+            tunnel_fast(client_socket, remote, stats.clone()).await?;
+        }
+        Ok(Err(e)) => {
+            analyze_ssl_error(&host, port, &e);
+            stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("SOCKS5 failed to connect to {}:{} - {}", host, port, e);
+            // Map common errors to SOCKS5 reply codes.
+            let rep = match e.kind() {
+                std::io::ErrorKind::ConnectionRefused => 0x05, // Connection refused
+                std::io::ErrorKind::TimedOut => 0x06,           // TTL expired
+                std::io::ErrorKind::HostUnreachable => 0x04,
+                std::io::ErrorKind::NetworkUnreachable => 0x03,
+                _ => 0x01, // general SOCKS server failure
+            };
+            let _ = send_reply(&mut client_socket, rep).await;
+        }
+        Err(_) => {
+            stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("SOCKS5 timeout connecting to {}:{}", host, port);
+            let _ = send_reply(&mut client_socket, 0x06).await; // TTL expired
+        }
+    }
+
     Ok(())
 }
 
