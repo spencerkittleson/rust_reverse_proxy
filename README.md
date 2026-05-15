@@ -1,16 +1,16 @@
 # Rust Forward Transparent Proxy Server
 
-A high-performance, configurable HTTP/HTTPS proxy server written in Rust with advanced SSL/TLS intelligence and Windows integration.
+A high-performance, configurable HTTP/HTTPS/SOCKS5 proxy server written in Rust with advanced SSL/TLS intelligence and Windows integration.
 
 ## Features
 
-- **HTTP and HTTPS Proxy Support**: Handles both HTTP requests and HTTPS CONNECT tunnels
+- **HTTP, HTTPS, and SOCKS5 Proxy Support**: Auto-detects HTTP vs SOCKS5 on the same port; tunnels HTTPS via CONNECT and arbitrary TCP via SOCKS5 (RFC 1928)
 - **Advanced SSL/TLS Intelligence**: Sophisticated certificate error detection with 25+ error patterns and VPN-aware context
 - **Windows Integration**: Automatic firewall configuration, network profile management, and power optimization
 - **Cross-Platform Binaries**: Pre-built releases for Windows x64, Linux x64, macOS x64/arm64
 - **Configurable Network Settings**: Customizable host and port with connection limiting
 - **Comprehensive Logging**: Configurable log levels (debug, info, warn, error) with detailed diagnostics
-- **Performance Optimized**: 64KB buffers, connection limits (10,000), timeouts, and size restrictions (1GB)
+- **Tunnel-Friendly Performance**: 64KB buffers, 10,000 concurrent connections, 1-hour idle timeout, 64GB per-direction transfer cap
 - **Robust Error Handling**: Intelligent SSL error analysis with actionable recommendations
 - **Async Architecture**: Built on tokio for high-performance concurrent connections
 - **Automated Releases**: GitHub Actions workflow for automated cross-platform builds and releases
@@ -95,6 +95,41 @@ curl -x http://127.0.0.1:3128 http://example.com
 curl -x http://127.0.0.1:3129 https://example.com
 ```
 
+### SOCKS5 Proxy
+
+The proxy auto-detects the protocol from the first byte of each connection, so
+the same listening port serves both HTTP/HTTPS clients and SOCKS5 clients. Only
+SOCKS5 with no authentication and the `CONNECT` command is supported (no SOCKS4,
+no UDP ASSOCIATE, no BIND, no username/password auth). IPv4, IPv6, and
+domain-name destination addresses (ATYP 0x01, 0x03, 0x04) are all supported.
+
+```bash
+# Start proxy
+./target/release/rust_proxy --port 3129
+
+# curl over SOCKS5 (resolve hostname locally)
+curl --socks5 127.0.0.1:3129 https://example.com
+
+# curl over SOCKS5 (let the proxy resolve the hostname — ATYP=domain)
+curl --socks5-hostname 127.0.0.1:3129 https://example.com
+```
+
+#### Tunneling SSH through the proxy
+
+SSH does not speak SOCKS5 natively, but it tunnels cleanly via `ProxyCommand`:
+
+```bash
+# One-off
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:3129 %h %p' user@target-host
+
+# Persistent (~/.ssh/config)
+# Host target-host
+#     ProxyCommand nc -X 5 -x 127.0.0.1:3129 %h %p
+#     ServerAliveInterval 60
+```
+
+`nc -X 5` (OpenBSD netcat) speaks SOCKS5 to the proxy; `ncat --proxy 127.0.0.1:3129 --proxy-type socks5` works equivalently. `ServerAliveInterval` is recommended to keep idle shells alive — although the proxy now allows 1 hour of idle, network middleboxes between you and the target may be stricter.
+
 ## Testing
 
 This project includes a comprehensive test suite covering unit tests, integration tests, and logging validation.
@@ -149,10 +184,12 @@ The test suite includes:
 - Command line argument parsing (`test_args_parsing`)
 - Log level configuration (`test_log_level_parsing`)
 
-**Integration Tests (4 tests in `tests/integration_tests.rs`):**
+**Integration Tests (6 tests in `tests/integration_tests.rs`):**
 - Proxy server startup and connectivity (`test_proxy_integration`)
 - HTTP proxy functionality (`test_http_proxy_request`)
 - HTTPS CONNECT tunneling (`test_connect_proxy_request`)
+- SOCKS5 CONNECT with IPv4 ATYP and bidirectional tunneling (`test_socks5_connect_ipv4`, port 3159)
+- SOCKS5 CONNECT with domain-name ATYP and bidirectional tunneling (`test_socks5_connect_domain`, port 3161)
 - Error handling for invalid requests (`test_proxy_handles_invalid_requests`)
 
 **Logging Tests (3 tests in `tests/logging_tests.rs`):**
@@ -163,7 +200,7 @@ The test suite includes:
 ### Test Environment
 
 Tests use temporary network configurations:
-- Various ports (3130-3142) to avoid conflicts
+- Various ports (3130-3162) to avoid conflicts
 - Mock servers for integration testing
 - Temporary files for log testing
 - Automatic cleanup after test completion
@@ -206,8 +243,8 @@ wrk -t4 -c100 -d30s --timeout 10s http://127.0.0.1:3129/
 
 - **Max Connections**: 10,000 concurrent connections (configurable via `MAX_CONNECTIONS`)
 - **Connection Timeout**: 10 seconds for initial connection establishment
-- **Idle Timeout**: 5 minutes for inactive connections (300 seconds)
-- **Max Download Size**: 1GB per connection to prevent resource exhaustion
+- **Idle Timeout**: 1 hour for inactive connections (3600 seconds — tunnel-friendly for SSH and other long-lived streams)
+- **Max Transfer per Direction**: 64GB per connection to prevent unbounded resource use while accommodating large `scp`/`rsync` flows
 - **Buffer Size**: 64KB for optimal throughput with `TCP_NODELAY`
 
 ### SSL/TLS Intelligence
@@ -234,7 +271,7 @@ The proxy includes advanced SSL certificate error detection:
 - `src/main.rs`: Binary entry point with Windows-specific integration and server startup
 - `src/lib.rs`: Core library with proxy logic, SSL intelligence, and connection handling
 - `tests/unit_tests.rs`: Unit tests for individual functions (9 tests)
-- `tests/integration_tests.rs`: Integration tests for proxy functionality (4 tests)
+- `tests/integration_tests.rs`: Integration tests for proxy functionality (6 tests, including SOCKS5)
 - `tests/logging_tests.rs`: Tests for logging system (3 tests)
 
 ### Dependencies

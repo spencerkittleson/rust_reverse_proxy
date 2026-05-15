@@ -17,8 +17,8 @@ pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 pub const BUFFER_SIZE: usize = 65536; // Larger buffer for better throughput
 pub const MAX_CONNECTIONS: usize = 10000; // Connection limit
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes idle timeout
-pub const MAX_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024; // 1GB max download
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(3600); // 1 hour idle timeout (tunnel-friendly: SSH, long-lived streams)
+pub const MAX_DOWNLOAD_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64GB per-direction transfer cap (tunnel-friendly: scp/rsync over SSH)
 
 // Statistics tracking
 #[derive(Debug)]
