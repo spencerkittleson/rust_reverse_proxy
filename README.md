@@ -11,6 +11,7 @@ A high-performance, configurable HTTP/HTTPS/SOCKS5 proxy server written in Rust 
 - **Configurable Network Settings**: Customizable host and port with connection limiting
 - **Comprehensive Logging**: Configurable log levels (debug, info, warn, error) with detailed diagnostics
 - **Tunnel-Friendly Performance**: 64KB buffers, 10,000 concurrent connections, 1-hour idle timeout, 64GB per-direction transfer cap
+- **FIN Propagation**: Writer shutdown on tunnel EOF ensures graceful connection termination
 - **Robust Error Handling**: Intelligent SSL error analysis with actionable recommendations
 - **Async Architecture**: Built on tokio for high-performance concurrent connections
 - **Automated Releases**: GitHub Actions workflow for automated cross-platform builds and releases
@@ -165,6 +166,9 @@ cargo test test_find_request_end
 # Run specific integration test
 cargo test test_proxy_integration
 
+# Run statistics tests
+cargo test --test statistics_tests
+
 # Run with verbose output
 cargo test -- --nocapture
 
@@ -196,6 +200,10 @@ The test suite includes:
 - Log output verification (`test_logging_output_to_file`)
 - All log level configurations (`test_logging_levels`)
 - Invalid log level handling (`test_invalid_log_level_handling`)
+
+**Statistics Tests (in `tests/statistics_tests.rs`):**
+- ProxyStats tracking for active connections, bytes transferred, and total connections
+- Periodic stats logging verification
 
 ### Test Environment
 
@@ -246,6 +254,27 @@ wrk -t4 -c100 -d30s --timeout 10s http://127.0.0.1:3129/
 - **Idle Timeout**: 1 hour for inactive connections (3600 seconds — tunnel-friendly for SSH and other long-lived streams)
 - **Max Transfer per Direction**: 64GB per connection to prevent unbounded resource use while accommodating large `scp`/`rsync` flows
 - **Buffer Size**: 64KB for optimal throughput with `TCP_NODELAY`
+- **Stats Flush**: Stats are flushed in batches (STATS_FLUSH_THRESHOLD) rather than per-byte, reducing atomic operations
+
+### Statistics
+
+The proxy tracks connection-level statistics via `ProxyStats`:
+
+- **Active Connections**: Current number of active proxy connections
+- **Bytes Transferred**: Total bytes transferred across all connections
+- **Total Connections**: Lifetime count of connections handled
+
+Stats are logged periodically every 3 minutes to provide visibility into proxy load without impacting per-byte throughput.
+
+### Graceful Shutdown
+
+The proxy handles `Ctrl+C` (SIGINT) with a graceful drain:
+
+1. On interrupt, the listener stops accepting new connections
+2. Existing connections are allowed to complete with a 30-second timeout
+3. After the timeout, remaining connections are force-closed
+
+This ensures that in-flight requests are not abruptly dropped during shutdown.
 
 ### SSL/TLS Intelligence
 
@@ -273,6 +302,7 @@ The proxy includes advanced SSL certificate error detection:
 - `tests/unit_tests.rs`: Unit tests for individual functions (9 tests)
 - `tests/integration_tests.rs`: Integration tests for proxy functionality (6 tests, including SOCKS5)
 - `tests/logging_tests.rs`: Tests for logging system (3 tests)
+- `tests/statistics_tests.rs`: Tests for ProxyStats tracking and periodic logging
 
 ### Dependencies
 
