@@ -14,11 +14,12 @@ pub mod windows;
 
 pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 
-pub const BUFFER_SIZE: usize = 65536; // Larger buffer for better throughput
-pub const MAX_CONNECTIONS: usize = 10000; // Connection limit
+pub const BUFFER_SIZE: usize = 16384; // 16KB — low-latency forwarding
+pub const MAX_CONNECTIONS: usize = 1000; // Connection limit
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(3600); // 1 hour idle timeout (tunnel-friendly: SSH, long-lived streams)
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_DOWNLOAD_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64GB per-direction transfer cap (tunnel-friendly: scp/rsync over SSH)
+pub const STATS_FLUSH_THRESHOLD: u64 = 65536;
 
 // Statistics tracking
 #[derive(Debug)]
@@ -105,13 +106,25 @@ pub fn find_request_end(data: &[u8]) -> usize {
 }
 
 // Optimized host:port parsing
-pub fn parse_host_port(url: &str, default_port: u16) -> (&str, u16) {
-    match url.split_once(':') {
+pub fn parse_host_port(url: &str, default_port: u16) -> Result<(&str, u16), ProxyError> {
+    match url.rsplit_once(':') {
         Some((host, port_str)) => {
-            let port = port_str.parse::<u16>().unwrap_or(default_port);
-            (host, port)
+            let port = port_str.parse::<u16>()
+                .map_err(|_| format!("Invalid port in '{}'", url))?;
+            Ok((host, port))
         }
-        None => (url, default_port)
+        None => Ok((url, default_port))
+    }
+}
+
+fn match_ssl_cause(error_str: &str) -> (&'static str, &'static str) {
+    match error_str {
+        s if s.contains("expired") => ("Certificate has expired", "Update certificate on target server"),
+        s if s.contains("self-signed") || s.contains("untrusted") => ("Certificate is self-signed or untrusted", "Add certificate to trust store or use valid certificate"),
+        s if s.contains("handshake") => ("TLS handshake failed", "Check certificate compatibility and TLS version"),
+        s if s.contains("verify") => ("Certificate verification failed", "Check certificate chain and CA trust"),
+        s if s.contains("revoked") => ("Certificate has been revoked", "Renew certificate with new signing"),
+        _ => ("Unknown SSL/TLS certificate issue", "Investigate certificate validity and trust"),
     }
 }
 
@@ -152,26 +165,9 @@ fn analyze_ssl_error(host: &str, port: u16, error: &std::io::Error) {
         warn!("   Target: {}:{}", host, port);
         warn!("   Error: {}", error_display);
 
-        // Provide specific guidance based on error type
-        if error_str.contains("expired") {
-            warn!("   Cause: Certificate has expired");
-            warn!("   Action: Update certificate on target server");
-        } else if error_str.contains("self-signed") || error_str.contains("untrusted") {
-            warn!("   Cause: Certificate is self-signed or untrusted");
-            warn!("   Action: Add certificate to trust store or use valid certificate");
-        } else if error_str.contains("handshake") {
-            warn!("   Cause: TLS handshake failed");
-            warn!("   Action: Check certificate compatibility and TLS version");
-        } else if error_str.contains("verify") {
-            warn!("   Cause: Certificate verification failed");
-            warn!("   Action: Check certificate chain and CA trust");
-        } else if error_str.contains("revoked") {
-            warn!("   Cause: Certificate has been revoked");
-            warn!("   Action: Renew certificate with new signing");
-        } else {
-            warn!("   Cause: Unknown SSL/TLS certificate issue");
-            warn!("   Action: Investigate certificate validity and trust");
-        }
+        let (cause, action) = match_ssl_cause(&error_str);
+        warn!("   Cause: {}", cause);
+        warn!("   Action: {}", action);
 
         // Additional context for VPN scenarios
         if cfg!(windows) {
@@ -209,21 +205,67 @@ pub async fn handle_client(client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
     result
 }
 
+async fn connect_and_tunnel(
+    mut client_socket: TcpStream,
+    host: &str,
+    port: u16,
+    forward_headers: bool,
+    raw_headers: &[u8],
+    on_error: impl FnOnce(&std::io::Error),
+    stats: Arc<ProxyStats>,
+) -> Result<(), ProxyError> {
+    match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(mut remote)) => {
+            debug!("Connected to {}:{}", host, port);
+            if forward_headers {
+                remote.set_nodelay(true)?;
+                remote.write_all(raw_headers).await?;
+            } else {
+                client_socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+            }
+            tunnel_fast(client_socket, remote, stats).await
+        }
+        Ok(Err(e)) => {
+            on_error(&e);
+            stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("Failed to connect to {}:{} - {}", host, port, e);
+            client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            Ok(())
+        }
+        Err(_) => {
+            stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("Timeout connecting to {}:{}", host, port);
+            client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            Ok(())
+        }
+    }
+}
+
 async fn handle_http(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
-    let mut buffer = vec![0; BUFFER_SIZE];
-    let bytes_read = timeout(CONNECT_TIMEOUT, client_socket.read(&mut buffer)).await??;
+    // Read headers incrementally — no large upfront buffer
+    let mut raw_headers = Vec::new();
+    let mut small_buf = [0u8; 1024];
+    let max_header_size = 8192;
 
-    if bytes_read == 0 {
-        return Ok(());
+    loop {
+        let n = timeout(CONNECT_TIMEOUT, client_socket.read(&mut small_buf))
+            .await
+            .map_err(|_| ProxyError::from("Timeout reading request headers"))??;
+        if n == 0 {
+            return Ok(());
+        }
+        raw_headers.extend_from_slice(&small_buf[..n]);
+
+        if raw_headers.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+
+        if raw_headers.len() > max_header_size {
+            return Err("Headers too large".into());
+        }
     }
 
-    // Find end of headers more efficiently
-    let request_end = find_request_end(&buffer[..bytes_read]);
-    if request_end == 0 {
-        return Ok(());
-    }
-
-    let request = String::from_utf8_lossy(&buffer[..request_end]);
+    let request = String::from_utf8_lossy(&raw_headers);
     let first_line = request.lines().next().ok_or("Empty request")?;
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
@@ -235,63 +277,22 @@ async fn handle_http(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Re
     let url = parts[1];
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        // HTTPS request
-        let (host, port) = parse_host_port(url, 443);
+        let (host, port) = parse_host_port(url, 443)?;
         stats.https_requests.fetch_add(1, Ordering::Relaxed);
         info!("HTTPS CONNECT request to {}:{}", host, port);
-
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-            Ok(Ok(remote)) => {
-                debug!("Connected to {}:{}", host, port);
-                client_socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-                tunnel_fast(client_socket, remote, stats.clone()).await?;
-            }
-            Ok(Err(e)) => {
-                // Analyze for SSL certificate issues
-                analyze_ssl_error(host, port, &e);
-                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Failed to connect to {}:{} - {}", host, port, e);
-                client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-            }
-            Err(_) => {
-                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Timeout connecting to {}:{}", host, port);
-                client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-            }
-        }
+        connect_and_tunnel(client_socket, host, port, false, &raw_headers, |e| analyze_ssl_error(host, port, e), stats).await?;
     } else {
-        // HTTP request
         let parsed_url = Url::parse(url)?;
         let scheme = parsed_url.scheme();
         let host = parsed_url.host_str().ok_or("No host found")?;
         let port = parsed_url.port().unwrap_or(if scheme == "https" { 443 } else { 80 });
         stats.http_requests.fetch_add(1, Ordering::Relaxed);
         info!("HTTP {} request to {}://{}:{}", method, scheme, host, port);
-
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-            Ok(Ok(mut remote)) => {
-                remote.set_nodelay(true)?;
-                debug!("Connected to {}://{}:{}", scheme, host, port);
-
-                // Send the original request
-                remote.write_all(&buffer[..bytes_read]).await?;
-                tunnel_fast(client_socket, remote, stats.clone()).await?;
+        connect_and_tunnel(client_socket, host, port, scheme == "http", &raw_headers, |e| {
+            if scheme == "https" {
+                analyze_ssl_error(host, port, e);
             }
-            Ok(Err(e)) => {
-                // Analyze for SSL certificate issues for HTTPS URLs
-                if scheme == "https" {
-                    analyze_ssl_error(host, port, &e);
-                }
-                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Failed to connect to {}://{}:{} - {}", scheme, host, port, e);
-                client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-            }
-            Err(_) => {
-                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("Timeout connecting to {}://{}:{}", scheme, host, port);
-                client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-            }
-        }
+        }, stats).await?;
     }
 
     Ok(())
@@ -415,14 +416,75 @@ async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
     Ok(())
 }
 
+#[cfg(unix)]
+const TCP_QUICKACK: i32 = 12;
+#[cfg(unix)]
+const TCP_USER_TIMEOUT: i32 = 18;
+
+#[cfg(unix)]
+fn configure_keepalive(src: &TcpStream, dst: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+
+    fn set_sock(fd: i32, level: i32, opt: i32, val: i32) {
+        let _ = unsafe {
+            libc::setsockopt(fd, level, opt,
+                &val as *const _ as *const _,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+    }
+
+    let one = 1i32;
+    set_sock(src.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
+    set_sock(dst.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
+    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, TCP_QUICKACK, one);
+    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, TCP_QUICKACK, one);
+    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
+    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
+}
+
+#[cfg(windows)]
+fn configure_keepalive(src: &TcpStream, dst: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct TcpKeepalive {
+        onoff: u32,
+        keepalivetime: u32,
+        keepaliveinterval: u32,
+    }
+
+    const SIO_KEEPALIVE_VALS: u32 = 0xFC000006;
+
+    let ka = TcpKeepalive {
+        onoff: 1,
+        keepalivetime: 60000,
+        keepaliveinterval: 1000,
+    };
+
+    fn set_keepalive(socket: winapi::um::winsock2::SOCKET, ka: &TcpKeepalive) {
+        let _ = unsafe {
+            let mut ret = 0;
+            winapi::um::winsock2::WSAIoctl(
+                socket, SIO_KEEPALIVE_VALS,
+                ka as *const _ as *mut _,
+                std::mem::size_of::<TcpKeepalive>() as _,
+                std::ptr::null_mut(), 0,
+                &mut ret, std::ptr::null_mut(), None,
+            )
+        };
+    }
+
+    set_keepalive(src.as_raw_socket() as _, &ka);
+    set_keepalive(dst.as_raw_socket() as _, &ka);
+}
+
 async fn tunnel_fast(mut src: TcpStream, mut dst: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
-    // Configure both sockets for better performance
     src.set_nodelay(true)?;
     dst.set_nodelay(true)?;
-
-    // Get addresses for error reporting before splitting
-    let src_addr = src.peer_addr().map(|a| a.to_string()).ok();
-    let dst_addr = dst.peer_addr().map(|a| a.to_string()).ok();
+    configure_keepalive(&src, &dst);
 
     let (mut src_reader, mut src_writer) = src.split();
     let (mut dst_reader, mut dst_writer) = dst.split();
@@ -431,12 +493,12 @@ async fn tunnel_fast(mut src: TcpStream, mut dst: TcpStream, stats: Arc<ProxySta
     let stats_clone = stats.clone();
     let client_to_server = bounded_copy_with_stats(
         &mut src_reader, &mut dst_writer, MAX_DOWNLOAD_SIZE, IDLE_TIMEOUT,
-        src_addr.as_deref(), dst_addr.as_deref(), "client->server", stats_clone
+        "client->server", stats_clone
     );
     let stats_clone = stats.clone();
     let server_to_client = bounded_copy_with_stats(
         &mut dst_reader, &mut src_writer, MAX_DOWNLOAD_SIZE, IDLE_TIMEOUT,
-        dst_addr.as_deref(), src_addr.as_deref(), "server->client", stats_clone
+        "server->client", stats_clone
     );
 
     tokio::try_join!(client_to_server, server_to_client)?;
@@ -449,8 +511,6 @@ pub async fn bounded_copy_with_stats<R, W>(
     mut writer: W,
     max_size: u64,
     idle_timeout: Duration,
-    _src_addr: Option<&str>,
-    _dst_addr: Option<&str>,
     direction: &str,
     stats: Arc<ProxyStats>,
 ) -> Result<(), ProxyError>
@@ -458,20 +518,27 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let mut transferred = 0u64;
+    let mut bytes_read = 0u64;
+    let mut last_flushed = 0u64;
     let mut buffer = vec![0; BUFFER_SIZE];
 
     loop {
         let read_result = timeout(idle_timeout, reader.read(&mut buffer)).await;
 
         match read_result {
-            Ok(Ok(0)) => break, // EOF
+            Ok(Ok(0)) => {
+                writer.shutdown().await.ok();
+                break;
+            }
             Ok(Ok(n)) => {
-                transferred += n as u64;
-                stats.bytes_transferred.fetch_add(n as u64, Ordering::Relaxed);
+                bytes_read += n as u64;
+                if (bytes_read - last_flushed) >= STATS_FLUSH_THRESHOLD {
+                    stats.bytes_transferred.fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
+                    last_flushed = bytes_read;
+                }
 
-                if transferred > max_size {
-                    warn!("Download size limit exceeded: {} bytes", transferred);
+                if bytes_read > max_size {
+                    warn!("Download size limit exceeded: {} bytes", bytes_read);
                     return Err("Download size limit exceeded".into());
                 }
 
@@ -499,131 +566,10 @@ where
         }
     }
 
-    Ok(())
-}
-
-// Copy with size limits and SSL error detection
-pub async fn bounded_copy_with_ssl_detection<R, W>(
-    mut reader: R,
-    mut writer: W,
-    max_size: u64,
-    idle_timeout: Duration,
-    src_addr: Option<&str>,
-    dst_addr: Option<&str>,
-    direction: &str,
-) -> Result<(), ProxyError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut transferred = 0u64;
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    loop {
-        let read_result = timeout(idle_timeout, reader.read(&mut buffer)).await;
-
-        match read_result {
-            Ok(Ok(0)) => break, // EOF
-            Ok(Ok(n)) => {
-                transferred += n as u64;
-                if transferred > max_size {
-                    warn!("Download size limit exceeded: {} bytes", transferred);
-                    return Err("Download size limit exceeded".into());
-                }
-
-                let write_result = timeout(idle_timeout, writer.write_all(&buffer[..n])).await;
-                match write_result {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        debug!("Write error in {}: {}", direction, e);
-                        return Err("Write error".into());
-                    }
-                    Err(_) => {
-                        warn!("Write timeout in {}", direction);
-                        return Err("Write timeout".into());
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                let error_str = e.to_string().to_lowercase();
-
-                // Check for SSL/TLS related errors that might indicate certificate issues
-                if error_str.contains("tls") || error_str.contains("ssl") ||
-                   error_str.contains("handshake") || error_str.contains("certificate") {
-                    warn!("🔒 SSL/TLS Error During Data Transfer");
-                    if let Some(src) = src_addr {
-                        warn!("   Source: {}", src);
-                    }
-                    if let Some(dst) = dst_addr {
-                        warn!("   Destination: {}", dst);
-                    }
-                    warn!("   Direction: {}", direction);
-                    warn!("   Error: {}", e);
-                    warn!("   Note: This may indicate certificate validation issues during TLS handshake");
-                } else {
-                    debug!("Read error in {}: {}", direction, e);
-                }
-                return Err(e.into());
-            }
-            Err(_) => {
-                warn!("Connection idle timeout in {}", direction);
-                return Err("Idle timeout".into());
-            }
-        }
+    if bytes_read > last_flushed {
+        stats.bytes_transferred.fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
     }
 
     Ok(())
 }
 
-// Copy with size limits and idle timeout (legacy version)
-pub async fn bounded_copy<R, W>(
-    mut reader: R,
-    mut writer: W,
-    max_size: u64,
-    idle_timeout: Duration,
-) -> Result<(), ProxyError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut transferred = 0u64;
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    loop {
-        let read_result = timeout(idle_timeout, reader.read(&mut buffer)).await;
-
-        match read_result {
-            Ok(Ok(0)) => break, // EOF
-            Ok(Ok(n)) => {
-                transferred += n as u64;
-                if transferred > max_size {
-                    warn!("Download size limit exceeded: {} bytes", transferred);
-                    return Err("Download size limit exceeded".into());
-                }
-
-                let write_result = timeout(idle_timeout, writer.write_all(&buffer[..n])).await;
-                match write_result {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        debug!("Write error: {}", e);
-                        return Err("Write error".into());
-                    }
-                    Err(_) => {
-                        warn!("Write timeout");
-                        return Err("Write timeout".into());
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                debug!("Read error: {}", e);
-                return Err(e.into());
-            }
-            Err(_) => {
-                warn!("Connection idle timeout");
-                return Err("Idle timeout".into());
-            }
-        }
-    }
-
-    Ok(())
-}

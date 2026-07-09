@@ -2,6 +2,33 @@
 use std::process::Command;
 #[cfg(windows)]
 use log::{info, warn, debug};
+#[cfg(windows)]
+use winapi::um::winuser::{MessageBoxW, MB_YESNO, IDYES};
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::iter::once;
+
+#[cfg(windows)]
+fn prompt_for_setup() -> bool {
+    let message = "Do you want to run the setup script to configure the environment?";
+    let title = "Setup";
+    let wide_message: Vec<u16> = OsStr::new(message).encode_wide().chain(once(0u16)).collect();
+    let wide_title: Vec<u16> = OsStr::new(title).encode_wide().chain(once(0u16)).collect();
+
+    let result = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide_message.as_ptr(),
+            wide_title.as_ptr(),
+            MB_YESNO,
+        )
+    };
+
+    result == IDYES
+}
 
 #[cfg(windows)]
 pub fn is_running_as_admin() -> bool {
@@ -58,6 +85,26 @@ pub fn execute_cmd_batch(commands: &[&str]) -> Result<(), Box<dyn std::error::Er
 
 #[cfg(windows)]
 pub fn setup_windows_environment(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    if prompt_for_setup() {
+        info!("User agreed to run setup script.");
+        match Command::new("powershell")
+            .args(&["-ExecutionPolicy", "Bypass", "-File", "setup.ps1"])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                info!("Setup script executed successfully.");
+            }
+            Ok(status) => {
+                warn!("Setup script finished with a non-zero status: {}", status);
+            }
+            Err(e) => {
+                warn!("Failed to execute setup script: {}", e);
+            }
+        }
+    } else {
+        info!("User declined to run setup script.");
+    }
+
     if !is_running_as_admin() {
         warn!("Not running as administrator. Some Windows optimizations may be skipped.");
         info!("For full functionality, run as administrator or enable specific UAC prompts.");
@@ -66,7 +113,13 @@ pub fn setup_windows_environment(port: u16) -> Result<(), Box<dyn std::error::Er
     info!("Setting up Windows environment optimizations...");
     
     // Use single elevated PowerShell session to minimize UAC prompts
-    let elevated_script = format!(
+    let elevated_script = build_elevated_script(port);
+
+/// Build the elevated PowerShell setup script.
+/// Note: Rust raw string literals use `{{` and `}}` for literal braces,
+/// since PowerShell also uses `{}` for script blocks.
+fn build_elevated_script(port: u16) -> String {
+    format!(
         r#"
 # Start elevated PowerShell session if not already elevated
 if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {{
@@ -85,7 +138,7 @@ try {{
 try {{
     New-NetFirewallRule -DisplayName "Open Port {port}" -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow -ErrorAction SilentlyContinue
     Write-Host "Firewall rule added for port {port}"
-}} catch {{ 
+}} catch {{
     try {{
         netsh advfirewall firewall delete rule name="Open Port {port}" 2>$null
         netsh advfirewall firewall add rule name="Open Port {port}" dir=in action=allow protocol=TCP localport={port}
@@ -99,7 +152,7 @@ try {{
     powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
     powercfg /setactive SCHEME_CURRENT 2>$null
     Write-Host "Power settings configured (non-elevated)"
-}} catch {{ 
+}} catch {{
     if ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator") {{
         # Only elevate if we're already admin (no UAC prompt)
         try {{
@@ -116,7 +169,8 @@ try {{
 Write-Host "Windows environment setup completed"
 "#,
         port = port
-    );
+    )
+}
     
     match execute_powershell_script(&elevated_script) {
         Ok(output) => {

@@ -1,7 +1,33 @@
 use rust_proxy::*;
+use tokio::signal;
 
 #[cfg(windows)]
 use rust_proxy::windows;
+
+async fn accept_and_spawn(listener: &TcpListener, semaphore: &Arc<Semaphore>, stats: &Arc<ProxyStats>) {
+    let (client_socket, _) = match listener.accept().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Accept error: {}", e);
+            return;
+        }
+    };
+    let permit = match semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Semaphore error: {}", e);
+            return;
+        }
+    };
+    let stats_clone = stats.clone();
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(e) = handle_client(client_socket, stats_clone).await {
+            error!("Error handling client: {}", e);
+        }
+    });
+}
 
 #[tokio::main]
 async fn main() -> Result<(), ProxyError> {
@@ -58,16 +84,36 @@ async fn main() -> Result<(), ProxyError> {
     info!("Port configured: {}", args.port);
     info!("Statistics logging enabled (every 3 minutes in INFO mode)");
 
-    loop {
-        let (client_socket, _) = listener.accept().await?;
-        let permit = semaphore.clone().acquire_owned().await?;
-        let stats_clone = stats.clone();
-        
-        tokio::spawn(async move {
-            let _permit = permit; // Hold permit until task completes
-            if let Err(e) = handle_client(client_socket, stats_clone).await {
-                error!("Error handling client: {}", e);
+    let stats_for_accept = stats.clone();
+    let sem_for_accept = semaphore.clone();
+    tokio::select! {
+        _ = async {
+            loop {
+                accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept).await;
             }
-        });
+        } => {},
+        _ = signal::ctrl_c() => {
+            info!("Shutdown signal received. Draining active connections...");
+        }
     }
+
+    // Listener is dropped here, accept loop stops
+
+    let drain_ok = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if stats.active_connections.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }).await;
+
+    if drain_ok.is_ok() {
+        info!("All connections drained. Shutting down.");
+    } else {
+        warn!("Shutdown timed out with {} active connections. Forcing shutdown.",
+            stats.active_connections.load(Ordering::Relaxed));
+    }
+    
+    Ok(())
 }

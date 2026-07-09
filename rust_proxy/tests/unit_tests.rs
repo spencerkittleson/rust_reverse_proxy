@@ -1,8 +1,8 @@
-use rust_proxy::{find_request_end, parse_host_port, bounded_copy, ProxyStats, ProxyError, Args};
+use rust_proxy::{find_request_end, parse_host_port, ProxyStats, ProxyError, Args};
 use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn test_find_request_end() {
@@ -30,74 +30,22 @@ fn test_find_request_end() {
 #[test]
 fn test_parse_host_port() {
     // Test with port
-    let (host, port) = parse_host_port("example.com:8080", 80);
+    let (host, port) = parse_host_port("example.com:8080", 80).unwrap();
     assert_eq!(host, "example.com");
     assert_eq!(port, 8080);
 
     // Test without port (uses default)
-    let (host, port) = parse_host_port("example.com", 80);
+    let (host, port) = parse_host_port("example.com", 80).unwrap();
     assert_eq!(host, "example.com");
     assert_eq!(port, 80);
 
-    // Test with invalid port (uses default)
-    let (host, port) = parse_host_port("example.com:invalid", 80);
-    assert_eq!(host, "example.com");
-    assert_eq!(port, 80);
-
-    // Test with empty port
-    let (host, port) = parse_host_port("example.com:", 80);
-    assert_eq!(host, "example.com");
-    assert_eq!(port, 80);
-}
-
-#[tokio::test]
-async fn test_bounded_copy_basic() {
-    // Create a pipe to test bounded_copy
-    let (mut reader, mut writer) = tokio::io::duplex(64);
-    
-    // Write some test data
-    let test_data = b"Hello, world!";
-    writer.write_all(test_data).await.unwrap();
-    drop(writer); // Close writer to signal EOF
-
-    // Read back using bounded_copy
-    let mut output = Vec::new();
-    let result: Result<(), ProxyError> = bounded_copy(&mut reader, &mut output, 1024, Duration::from_secs(1)).await;
-    assert!(result.is_ok());
-    assert_eq!(output, test_data);
-}
-
-#[tokio::test]
-async fn test_bounded_copy_size_limit() {
-    // Create a pipe
-    let (mut reader, mut writer) = tokio::io::duplex(64);
-    
-    // Write data that exceeds limit
-    let test_data = b"This is a very long string that exceeds the limit";
-    writer.write_all(test_data).await.unwrap();
-    drop(writer);
-
-    // Read with small limit
-    let mut output = Vec::new();
-    let result: Result<(), ProxyError> = bounded_copy(&mut reader, &mut output, 10, Duration::from_secs(1)).await;
+    // Test with invalid port (returns error)
+    let result = parse_host_port("example.com:invalid", 80);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("size limit exceeded"));
-}
 
-#[tokio::test]
-async fn test_bounded_copy_timeout() {
-    // This test would require a more complex setup to simulate timeout
-    // For now, we'll just test that it doesn't timeout with valid data
-    let (mut reader, mut writer) = tokio::io::duplex(64);
-    
-    let test_data = b"Quick test";
-    writer.write_all(test_data).await.unwrap();
-    drop(writer);
-
-    let mut output = Vec::new();
-    let result: Result<(), ProxyError> = bounded_copy(&mut reader, &mut output, 1024, Duration::from_millis(100)).await;
-    assert!(result.is_ok());
-    assert_eq!(output, test_data);
+    // Test with empty port (returns error)
+    let result = parse_host_port("example.com:", 80);
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -279,8 +227,6 @@ async fn test_bounded_copy_with_stats() {
         &mut output, 
         1024, 
         Duration::from_secs(1),
-        Some("src"),
-        Some("dst"),
         "test",
         stats.clone()
     ).await;
@@ -314,8 +260,6 @@ async fn test_bounded_copy_with_stats_size_limit() {
         &mut output, 
         10, 
         Duration::from_secs(1),
-        None,
-        None,
         "test",
         stats.clone()
     ).await;
@@ -347,8 +291,6 @@ async fn test_bounded_copy_with_stats_timeout() {
         &mut output, 
         1024, 
         Duration::from_millis(10), // Very short timeout
-        None,
-        None,
         "timeout_test",
         stats.clone()
     ).await;
@@ -395,4 +337,47 @@ fn test_stats_concurrent_access() {
     // Bytes should be sum of all additions
     let expected_bytes: u64 = (0..10).flat_map(|i| (0..100).map(move |j| (i * 100 + j) as u64)).sum();
     assert_eq!(stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed), expected_bytes);
+}
+
+#[tokio::test]
+async fn test_bounded_copy_calls_shutdown_on_eof() {
+    use rust_proxy::bounded_copy_with_stats;
+
+    let (mut write_end, read_end) = tokio::io::duplex(64);
+
+    tokio::spawn(async move {
+        write_end.write_all(b"test data").await.unwrap();
+        drop(write_end);
+    });
+
+    let (mut tracked_write, mut tracked_read) = tokio::io::duplex(64);
+
+    let shutdown_detected = Arc::new(tokio::sync::Notify::new());
+    let notify_clone = shutdown_detected.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        // Drain any data first, then check for EOF (shutdown)
+        while tracked_read.read(&mut buf).await.unwrap_or(0) > 0 {}
+        notify_clone.notify_one();
+    });
+
+    let stats = Arc::new(ProxyStats::new());
+
+    let copy_result = bounded_copy_with_stats(
+        read_end, &mut tracked_write, u64::MAX, Duration::from_secs(5),
+        "test", stats,
+    ).await;
+
+    assert!(copy_result.is_ok(), "copy should succeed");
+
+    let timeout_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        shutdown_detected.notified(),
+    ).await;
+
+    assert!(
+        timeout_result.is_ok(),
+        "shutdown() was not called on the writer after EOF — \
+         the tunnel half-close fix is not working."
+    );
 }
