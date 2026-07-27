@@ -542,7 +542,14 @@ impl RequestStream {
 
         if let Some(eol) = find(&self.response_head, CRLF) {
             let status_line = &self.response_head[..eol];
-            if status_line.windows(4).any(|w| w == b" 101") {
+            // Status code is the second whitespace-delimited token:
+            // `HTTP/1.1 101 Switching Protocols`. Match it positionally so a
+            // reason phrase containing "101" cannot trigger a false switch.
+            let is_switching = status_line
+                .split(|&b| b == b' ')
+                .nth(1)
+                .is_some_and(|code| code == b"101");
+            if is_switching {
                 self.state = State::Passthrough;
             }
             self.upgrade_offered = false;
@@ -658,7 +665,16 @@ impl RequestStream {
                     };
                     Ok(true)
                 }
-                Ok(httparse::Status::Partial) => Ok(false),
+                Ok(httparse::Status::Partial) => {
+                    // A chunk-size line (with extensions) that never completes must
+                    // not buffer without bound — cap it like a request head.
+                    if self.pending.len() > self.max_head {
+                        let all: Vec<u8> = self.pending.drain(..).collect();
+                        self.on_anomaly(RewriteAnomaly::HeadTooLarge, &all, out)?;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                }
                 Err(_) => {
                     let all: Vec<u8> = self.pending.drain(..).collect();
                     self.on_anomaly(RewriteAnomaly::Unparseable, &all, out)?;
@@ -686,6 +702,12 @@ impl RequestStream {
             }
             ChunkPhase::Trailers => {
                 let Some(p) = find(&self.pending, CRLF) else {
+                    // An unterminated trailer block must not buffer without bound.
+                    if self.pending.len() > self.max_head {
+                        let all: Vec<u8> = self.pending.drain(..).collect();
+                        self.on_anomaly(RewriteAnomaly::HeadTooLarge, &all, out)?;
+                        return Ok(true);
+                    }
                     return Ok(false);
                 };
                 out.extend(self.pending.drain(..p + 2));

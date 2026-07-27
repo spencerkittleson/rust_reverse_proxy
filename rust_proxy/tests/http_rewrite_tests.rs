@@ -586,3 +586,71 @@ fn split_status_line_is_still_detected() {
     }
     assert!(stream.is_passthrough());
 }
+
+#[test]
+fn unbounded_chunk_size_line_fails_closed() {
+    // A chunk-size line with endless extension octets and no CRLF must be
+    // capped, not buffered without bound.
+    let mut input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
+    input.extend(std::iter::repeat_n(b'a', 70_000));
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    let mut result = Ok(());
+    for piece in input.chunks(4096) {
+        result = stream.push(piece, &mut out);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+}
+
+#[test]
+fn unbounded_trailer_block_fails_closed() {
+    // A trailer section that never terminates must be capped.
+    let mut input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: ".to_vec();
+    input.extend(std::iter::repeat_n(b'a', 70_000));
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    let mut result = Ok(());
+    for piece in input.chunks(4096) {
+        result = stream.push(piece, &mut out);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+}
+
+#[test]
+fn reason_phrase_containing_101_does_not_switch_to_passthrough() {
+    // A non-101 status whose reason phrase contains "101" must NOT flip to
+    // passthrough — that would silently disable rewriting and leak.
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+    stream.observe_response(b"HTTP/1.1 500 Error 101 things\r\n");
+    assert!(!stream.is_passthrough());
+
+    // and a later request is still rewritten to origin-form
+    out.clear();
+    stream
+        .push(
+            b"GET http://e.example/after HTTP/1.1\r\nHost: e.example\r\n\r\n",
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "GET /after HTTP/1.1\r\nHost: e.example\r\n\r\n"
+    );
+}
+
+#[test]
+fn genuine_101_still_switches_to_passthrough() {
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+    stream.observe_response(b"HTTP/1.1 101 Switching Protocols\r\n");
+    assert!(stream.is_passthrough());
+}
