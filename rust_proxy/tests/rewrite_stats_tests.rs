@@ -81,3 +81,52 @@ fn log_stats_runs_with_and_without_anomalies() {
     stats.set_fallback_active(true);
     stats.log_stats();
 }
+
+use clap::Parser;
+use rust_proxy::http_rewrite::RewritePolicy;
+use rust_proxy::Args;
+
+#[test]
+fn fallback_is_off_by_default() {
+    // The safe posture must be the one you get without thinking about it.
+    let args = Args::try_parse_from(["rust_proxy"]).unwrap();
+    assert!(!args.rewrite_fallback);
+    assert_eq!(args.rewrite_policy(), RewritePolicy::FailClosed);
+}
+
+#[test]
+fn fallback_flag_opts_into_leaking() {
+    let args = Args::try_parse_from(["rust_proxy", "--rewrite-fallback"]).unwrap();
+    assert!(args.rewrite_fallback);
+    assert_eq!(args.rewrite_policy(), RewritePolicy::Fallback);
+}
+
+#[test]
+fn fallback_flag_composes_with_existing_flags() {
+    let args = Args::try_parse_from([
+        "rust_proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9999",
+        "--rewrite-fallback",
+    ])
+    .unwrap();
+    assert_eq!(args.host, "127.0.0.1");
+    assert_eq!(args.port, 9999);
+    assert!(args.rewrite_fallback);
+}
+
+#[test]
+fn help_text_names_the_privacy_cost() {
+    // A flag whose downside is discoverable only by reading the design doc is a trap.
+    let help = Args::try_parse_from(["rust_proxy", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("--rewrite-fallback"));
+    let lowered = help.to_lowercase();
+    assert!(
+        lowered.contains("leak"),
+        "help must state the leak: {help}"
+    );
+}

@@ -155,7 +155,7 @@ impl ProxyStats {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Host to listen on (default: 0.0.0.0)
@@ -169,6 +169,21 @@ pub struct Args {
     /// Log level: debug, info, warn, error (default: info)
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
+
+    /// Forward requests verbatim when rewriting fails instead of closing the
+    /// connection. Leaks proxy presence to the origin for each affected request.
+    #[arg(long, default_value_t = false)]
+    pub rewrite_fallback: bool,
+}
+
+impl Args {
+    pub fn rewrite_policy(&self) -> crate::http_rewrite::RewritePolicy {
+        if self.rewrite_fallback {
+            crate::http_rewrite::RewritePolicy::Fallback
+        } else {
+            crate::http_rewrite::RewritePolicy::FailClosed
+        }
+    }
 }
 
 // Optimized function to find end of HTTP headers
