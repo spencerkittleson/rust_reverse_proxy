@@ -45,6 +45,11 @@ from this.
   just the first.
 - Removing non-default TCP timers from the origin-facing socket.
 - Fixing the latent `https://`-absolute-form bug at `lib.rs:291`.
+- Raising the request head cap from 8KB to 64KB, which eliminates the most likely
+  source of spurious rewrite anomalies.
+- Reason-keyed anomaly counters surfaced in the existing 180s health report.
+- A `--rewrite-fallback` flag (off by default) trading privacy for availability
+  when the rewriter mishandles a client.
 
 **Explicit non-goals**
 
@@ -150,7 +155,12 @@ Exactly five edits, applied in the numbered order below — rule 5 operates on t
 Written as rules so a later change does not helpfully reintroduce them: never
 emit `Via`, `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `Proxy-Agent`, `Server`,
 or `Date`. Never reorder headers. Never alter field-name casing. Never adjust
-whitespace around `:`. Never fold or unfold `obs-fold` continuation lines.
+whitespace around `:`. Never fold or unfold `obs-fold` continuation lines —
+headers containing `obs-fold` are passed through byte-for-byte. Since no modern
+client emits `obs-fold`, byte-identity with a direct client is unaffected either
+way; passing it through is simply the least-touch option. The sole exception is
+`obs-fold` inside one of the five headers rules 1-5 must modify, which is handled
+as an anomaly below.
 
 ## Message framing
 
@@ -162,22 +172,46 @@ Body framing, in precedence order:
 3. Neither → no body; the next head begins immediately.
 
 Pipelined heads arriving in a single read are handled by looping until the buffer
-drains. The head size cap stays at the existing 8192 bytes (`lib.rs:248`).
+drains.
 
-### Fail closed, never leak
+**The head size cap rises from 8192 (`lib.rs:248`) to 65536.** 8KB is the single
+likeliest cause of spurious anomalies in practice — browsers with large cookie
+jars and `Authorization: Bearer` tokens exceed it routinely. Raising the cap is
+the actual fix for that class; no fallback behavior is needed to accommodate it.
 
-On any framing ambiguity or parse failure, terminate the connection rather than
-degrade to verbatim forwarding — verbatim forwarding *is* the leak. This covers:
+### Anomaly handling
 
-- `Transfer-Encoding: chunked` and `Content-Length` both present (also a request
-  smuggling vector, so refusing is correct on two counts)
-- duplicate conflicting `Content-Length`
-- `obs-fold` that cannot be rewritten safely
-- oversized heads
-- a mid-stream request that is not in absolute form
+Two response modes, selected by the `--rewrite-fallback` flag.
 
-This is a deliberate availability-for-privacy trade: a malformed request drops the
-connection instead of silently announcing the proxy.
+**Default (flag absent): fail closed.** Terminate the connection rather than
+forward unrewritten bytes, because forwarding unrewritten bytes *is* the leak.
+Verbatim fallback is a retroactive privacy failure: once it fires, the
+absolute-form request line has already reached the origin, and the periodic health
+report can only tell you afterward. Failing closed surfaces the same information
+immediately, through the broken request.
+
+**With `--rewrite-fallback`: forward verbatim and count it.** For diagnosing a
+client that the rewriter mishandles, at the cost of leaking on each occurrence.
+The health report displays a persistent banner while the flag is active so the
+trade is never silent.
+
+The residual anomaly set, after the head cap increase:
+
+| Anomaly | Fallback eligible |
+| --- | --- |
+| `head_too_large` (>64KB) | yes |
+| `obs_fold_in_rewritten_header` | yes |
+| `unparseable` — not recognizable as an HTTP/1.x request | yes |
+| `framing_conflict` — `TE: chunked` + `Content-Length`, or duplicate conflicting `Content-Length` | **no, never** |
+
+`framing_conflict` fails closed regardless of the flag. It is a request-smuggling
+vector, and forwarding it verbatim would make the proxy a smuggling gadget aimed
+at whatever origin it is talking to. That refusal rests on security grounds
+independent of privacy, so it is not the user's trade to make.
+
+**A mid-stream request already in origin form is not an anomaly.** Forwarding it
+leaks nothing, because origin form is exactly what rule 1 would produce. It takes
+rules 2-5 and nothing else, and is a fully supported input.
 
 ### `Upgrade` handling
 
@@ -220,33 +254,95 @@ fingerprint fix and the correct behavior coincide.
 
 Client-facing errors are unchanged. The 502s reach only the local client.
 
-Sanitize and framing failures form a new error class. Behavior depends on timing:
-on the first head, before any bytes have gone upstream, a 502 can still be
-returned to the client. Mid-stream it cannot — a status line cannot be injected
-into a relay already in progress — so the connection closes.
+When an anomaly fails closed, behavior depends on timing: on the first head,
+before any bytes have gone upstream, a 502 can still be returned to the client.
+Mid-stream it cannot — a status line cannot be injected into a relay already in
+progress — so the connection closes.
 
-Every such failure logs at `warn` with the reason and target host, and increments
-a new `rewrite_failures` counter on `ProxyStats` (`lib.rs:26-77`). Without that
-counter, fail-closed behavior becomes silent connection drops and is very hard to
-debug. Header bytes are logged at `debug` only, never `info`.
+Every anomaly, whether it failed closed or fell back, logs at `warn` with its
+reason and target host and increments its reason counter. Header bytes are logged
+at `debug` only, never `info`.
+
+## Observability
+
+Anomalies are useless unless visible, and a silently-dropped connection is
+miserable to debug. Both modes therefore feed the same counters.
+
+`ProxyStats` (`lib.rs:26-77`) gains a `[AtomicU64; N]` array indexed by a
+`RewriteAnomaly` enum, plus a `requests_sanitized` counter. Reason-keyed rather
+than a single total, so the report says *what* went wrong; array-indexed rather
+than named fields, so adding a reason is one line and the report iterates. Each
+reason also retains the last offending host in a small lock (`Mutex<Option<String>>`
+or equivalent) — one string per reason, written only on anomaly, so it costs
+nothing on the hot path.
+
+`log_stats` (`lib.rs:57-76`, fired every 180s from `main.rs:72`) gains a rewrite
+block. Only non-zero reasons print, so a clean run stays a single line:
+
+```
+   Rewrite: 1,234 sanitized, 0 anomalies
+```
+
+A run with problems itemizes them:
+
+```
+   Rewrite: 1,230 sanitized, 4 anomalies
+      head_too_large: 3 (last: api.example.com)
+      framing_conflict: 1 (last: legacy.internal)
+```
+
+While `--rewrite-fallback` is active the block carries a persistent banner, so an
+ongoing privacy trade can never be forgotten about:
+
+```
+   Rewrite: 1,230 sanitized, 4 anomalies
+      ⚠ --rewrite-fallback ACTIVE — 3 requests forwarded unrewritten (proxy visible to origin)
+      head_too_large: 3 (last: api.example.com)
+```
+
+The banner counts only fallback-eligible anomalies that actually forwarded, since
+`framing_conflict` fails closed regardless and leaks nothing.
+
+## CLI surface
+
+One new flag on `Args` (`lib.rs:79-93`), joining `--host`, `--port`, and
+`--log-level`:
+
+```
+--rewrite-fallback    Forward requests verbatim when rewriting fails, instead of
+                      closing the connection. Leaks proxy presence to the origin
+                      for each affected request. Off by default.
+```
+
+The help text names the cost explicitly. A flag whose downside is discoverable
+only by reading the design doc is a trap.
 
 ## Testing
 
-Three layers, ascending in value.
+Four layers, ascending in value.
 
 **Unit — byte-exact, table-driven** over `sanitize_request_head`: default-port
 stripping, non-default port retained, `Host` present-and-matching (must be a
 zero-byte change), present-and-disagreeing, absent, `Proxy-Connection` rename,
 `Proxy-Connection` dropped when `Connection` exists, `Proxy-Authorization`
 removal, `Connection`-token hop-by-hop removal, casing preserved, order
-preserved, empty path → `/`, query string preserved, HTTP/1.0.
+preserved, empty path → `/`, query string preserved, HTTP/1.0, `obs-fold` in an
+untouched header passed through byte-for-byte, and a mid-stream origin-form
+request taking rules 2-5 only.
 
 **Framing — fed one byte at a time** to catch split-read bugs: `Content-Length`
 bodies, chunked bodies, pipelined heads in a single read, `Upgrade`→`101`
 switching to passthrough, `Upgrade`→declined continuing to parse. Plus the case
 that motivated this architecture: **requests #2 and #3 on a reused connection
-must also be rewritten.** Plus the fail-closed set: `TE`+`CL` together,
-duplicate conflicting `CL`, oversized head, origin-form mid-stream.
+must also be rewritten.**
+
+**Anomaly behavior — each reason tested in both modes.** Default mode: every
+reason closes the connection and increments its counter. With
+`--rewrite-fallback`: `head_too_large`, `obs_fold_in_rewritten_header`, and
+`unparseable` forward verbatim and increment; `framing_conflict` **still closes**
+— that assertion is the guard against the smuggling hole, so it is the single most
+important test in this layer. Reasons cover heads over 64KB, `TE`+`CL` together,
+duplicate conflicting `CL`, and `obs-fold` inside a rewritten header.
 
 **Golden byte-equality — the test of the actual goal.** A small in-test origin
 server records the exact bytes it receives. The same request is issued twice,
@@ -263,7 +359,8 @@ regression guard for this feature.
 Add a README section stating plainly what this does and does not hide: the proxy
 no longer announces itself in the request bytes; the TLS fingerprint was always
 the client's own; the egress IP is unchanged; TCP/IP stack matching is an
-explicit non-goal.
+explicit non-goal. Document `--rewrite-fallback` alongside it, including the
+leak it accepts.
 
 While editing those paragraphs, correct the drift in the numbers being touched —
 the README claims 64KB buffers, 10,000 connections, and a 1-hour idle timeout,
