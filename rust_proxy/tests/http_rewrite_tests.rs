@@ -502,3 +502,87 @@ fn sanitized_request_count_tracks_successful_rewrites() {
     assert_eq!(stream.requests_sanitized(), 2);
     assert!(stream.take_anomalies().is_empty());
 }
+
+const WS_REQUEST: &[u8] = b"GET http://e.example/ws HTTP/1.1\r\nHost: e.example\r\n\
+                            Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+#[test]
+fn upgrade_request_arms_the_response_check_but_does_not_switch_yet() {
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+
+    assert!(stream.upgrade_offered());
+    assert!(
+        !stream.is_passthrough(),
+        "must not assume the upgrade succeeded"
+    );
+}
+
+#[test]
+fn accepted_upgrade_switches_to_passthrough() {
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+    stream.observe_response(b"HTTP/1.1 101 Switching Protocols\r\n");
+    assert!(stream.is_passthrough());
+
+    // Post-upgrade bytes are not HTTP and must survive untouched.
+    let mut frames = Vec::new();
+    stream.push(b"\x81\x03abc", &mut frames).unwrap();
+    assert_eq!(frames, b"\x81\x03abc".to_vec());
+}
+
+#[test]
+fn declined_upgrade_keeps_parsing_and_still_rewrites_later_requests() {
+    // This is why the response is consulted at all. Assuming success here would
+    // leak absolute form on every later request on this connection.
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+    stream.observe_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assert!(!stream.is_passthrough());
+
+    out.clear();
+    stream
+        .push(
+            b"GET http://e.example/after HTTP/1.1\r\nHost: e.example\r\n\r\n",
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "GET /after HTTP/1.1\r\nHost: e.example\r\n\r\n"
+    );
+}
+
+#[test]
+fn response_observation_is_inert_without_an_upgrade_offer() {
+    // The response path stays a blind relay for all normal traffic.
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream
+        .push(
+            b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\n\r\n",
+            &mut out,
+        )
+        .unwrap();
+    assert!(!stream.upgrade_offered());
+
+    stream.observe_response(b"HTTP/1.1 101 Switching Protocols\r\n");
+    assert!(
+        !stream.is_passthrough(),
+        "a stray 101 must not disarm request rewriting"
+    );
+}
+
+#[test]
+fn split_status_line_is_still_detected() {
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(WS_REQUEST, &mut out).unwrap();
+    for piece in b"HTTP/1.1 101 Switching Protocols\r\n".chunks(1) {
+        stream.observe_response(piece);
+    }
+    assert!(stream.is_passthrough());
+}

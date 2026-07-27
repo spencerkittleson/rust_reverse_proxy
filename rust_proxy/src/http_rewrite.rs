@@ -423,6 +423,24 @@ fn framing_of(head: &[u8]) -> Result<Framing, RewriteAnomaly> {
     }
 }
 
+/// Whether a request offers a protocol upgrade. Requires both the `Upgrade`
+/// header and the `upgrade` connection token, per RFC 7230.
+fn offers_upgrade(head: &[u8]) -> bool {
+    let Some((_, header_lines)) = split_head(head) else {
+        return false;
+    };
+    let has_upgrade_header = header_lines.iter().any(|l| name_is(l, b"Upgrade"));
+    let has_upgrade_token = header_lines
+        .iter()
+        .filter(|l| name_is(l, b"Connection") || name_is(l, b"Proxy-Connection"))
+        .any(|l| {
+            connection_tokens(header_value(l))
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(b"upgrade"))
+        });
+    has_upgrade_header && has_upgrade_token
+}
+
 /// What to do when a request cannot be rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewritePolicy {
@@ -459,6 +477,8 @@ pub struct RequestStream {
     policy: RewritePolicy,
     anomalies: Vec<RewriteAnomaly>,
     requests_sanitized: u64,
+    upgrade_offered: bool,
+    response_head: Vec<u8>,
 }
 
 impl RequestStream {
@@ -470,6 +490,8 @@ impl RequestStream {
             policy,
             anomalies: Vec::new(),
             requests_sanitized: 0,
+            upgrade_offered: false,
+            response_head: Vec::new(),
         }
     }
 
@@ -479,6 +501,39 @@ impl RequestStream {
 
     pub fn requests_sanitized(&self) -> u64 {
         self.requests_sanitized
+    }
+
+    pub fn upgrade_offered(&self) -> bool {
+        self.upgrade_offered
+    }
+
+    /// Feed origin→client bytes in only while an upgrade offer is outstanding.
+    ///
+    /// Switching to `Passthrough` on the request alone would leak absolute form
+    /// on every later request whenever the origin *declines* the upgrade, so the
+    /// status line is the deciding evidence. Inert otherwise, which keeps the
+    /// response path a blind zero-copy relay for all normal traffic.
+    pub fn observe_response(&mut self, bytes: &[u8]) {
+        if !self.upgrade_offered || matches!(self.state, State::Passthrough) {
+            return;
+        }
+        // Only ever buffers one short status line.
+        let room = 64usize.saturating_sub(self.response_head.len());
+        self.response_head
+            .extend_from_slice(&bytes[..std::cmp::min(room, bytes.len())]);
+
+        if let Some(eol) = find(&self.response_head, CRLF) {
+            let status_line = &self.response_head[..eol];
+            if status_line.windows(4).any(|w| w == b" 101") {
+                self.state = State::Passthrough;
+            }
+            self.upgrade_offered = false;
+            self.response_head.clear();
+        } else if self.response_head.len() >= 64 {
+            // Not a status line we recognize; stop watching.
+            self.upgrade_offered = false;
+            self.response_head.clear();
+        }
     }
 
     /// Drain recorded anomalies. Destructive, so a caller polling repeatedly
@@ -554,6 +609,10 @@ impl RequestStream {
 
         out.extend_from_slice(&sanitized);
         self.requests_sanitized += 1;
+        if offers_upgrade(head) {
+            self.upgrade_offered = true;
+            self.response_head.clear();
+        }
         self.state = match framing {
             Framing::None => State::ReadingHead,
             Framing::Length(n) => State::Body { remaining: n },
