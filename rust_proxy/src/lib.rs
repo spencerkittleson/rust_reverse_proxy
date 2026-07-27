@@ -12,6 +12,8 @@ pub use url::Url;
 #[cfg(windows)]
 pub mod windows;
 
+pub mod http_rewrite;
+
 pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 
 pub const BUFFER_SIZE: usize = 16384; // 16KB — low-latency forwarding
