@@ -6,7 +6,7 @@ A high-performance, configurable HTTP/HTTPS/SOCKS5 proxy server written in Rust 
 
 - **HTTP, HTTPS, and SOCKS5 Proxy Support**: Auto-detects HTTP vs SOCKS5 on the same port; tunnels HTTPS via CONNECT and arbitrary TCP via SOCKS5 (RFC 1928)
 - **Advanced SSL/TLS Intelligence**: Sophisticated certificate error detection with 25+ error patterns and VPN-aware context
-- **Windows Integration**: Automatic firewall configuration, network profile management, and power optimization
+- **Windows Integration**: Optional firewall configuration, network profile management, and power optimization (see [Windows startup behavior](#windows-startup-behavior))
 - **Cross-Platform Binaries**: Pre-built releases for Windows x64, Linux x64, macOS x64/arm64
 - **Configurable Network Settings**: Customizable host and port with connection limiting
 - **Comprehensive Logging**: Configurable log levels (debug, info, warn, error) with detailed diagnostics
@@ -147,6 +147,48 @@ Logs can be output to stderr or redirected to a file:
 # Combined logs with environment variables
 RUST_LOG=info ./target/release/rust_proxy --log-level debug 2> proxy.log
 ```
+
+## Windows startup behavior
+
+On Windows the proxy offers to run an optional setup script that applies host
+optimizations (a firewall rule for its port, setting the network profile to
+Private, disabling the lid-close action). None of this is required to proxy
+traffic — it is convenience configuration for the host.
+
+**The setup prompt auto-declines after 5 seconds.** The dialog must never block
+startup, because the proxy is frequently launched with no desktop to click on —
+over SSH, as a scheduled task, or as a service. If nobody answers within 5
+seconds the proxy logs the timeout, dismisses the dialog, and continues without
+setup:
+
+```
+INFO  rust_proxy::windows] Setup prompt unanswered after 5s — continuing without setup.
+```
+
+**Running without elevation is supported.** The host optimizations need
+administrator rights, so a non-elevated run logs a warning, skips what it cannot
+do, and proceeds to serve traffic normally:
+
+```
+WARN  rust_proxy::windows] Not running as administrator. Some Windows optimizations may be skipped.
+INFO  rust_proxy] Proxy server starting on 0.0.0.0:3129 (max connections: 1000)
+```
+
+Proxying itself never requires administrator rights — binding the default port
+(3129) does not need elevation. Elevation only affects whether the optional host
+optimizations succeed. If you reach the proxy from another machine and the
+connection is refused, add the inbound firewall rule yourself (or run once
+elevated) rather than assuming the proxy failed.
+
+Two caveats worth knowing:
+
+- Setup steps that require elevation are attempted even when the proxy already
+  knows it is not elevated, so a non-elevated start spends roughly ten extra
+  seconds failing them before it binds. The proxy still comes up.
+- Launching over SSH is subject to Windows OpenSSH terminating the session's
+  process tree on disconnect. To keep the proxy running after you log out, start
+  it from an interactive session or register it as a scheduled task rather than
+  backgrounding it from an SSH command.
 
 ## Usage Examples
 
