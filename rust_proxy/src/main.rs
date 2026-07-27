@@ -4,7 +4,12 @@ use tokio::signal;
 #[cfg(windows)]
 use rust_proxy::windows;
 
-async fn accept_and_spawn(listener: &TcpListener, semaphore: &Arc<Semaphore>, stats: &Arc<ProxyStats>) {
+async fn accept_and_spawn(
+    listener: &TcpListener,
+    semaphore: &Arc<Semaphore>,
+    stats: &Arc<ProxyStats>,
+    policy: rust_proxy::http_rewrite::RewritePolicy,
+) {
     let (client_socket, _) = match listener.accept().await {
         Ok(conn) => conn,
         Err(e) => {
@@ -23,7 +28,7 @@ async fn accept_and_spawn(listener: &TcpListener, semaphore: &Arc<Semaphore>, st
 
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(e) = handle_client(client_socket, stats_clone).await {
+        if let Err(e) = handle_client(client_socket, stats_clone, policy).await {
             error!("Error handling client: {}", e);
         }
     });
@@ -66,6 +71,13 @@ async fn main() -> Result<(), ProxyError> {
     // Initialize statistics
     let stats = Arc::new(ProxyStats::new());
     let stats_logger = stats.clone();
+
+    let policy = args.rewrite_policy();
+    stats.set_fallback_active(args.rewrite_fallback);
+    if args.rewrite_fallback {
+        warn!("--rewrite-fallback is enabled: requests that fail rewriting will be");
+        warn!("forwarded unrewritten, revealing proxy presence to the origin.");
+    }
     
     // Start periodic statistics logging task
     tokio::spawn(async move {
@@ -89,7 +101,7 @@ async fn main() -> Result<(), ProxyError> {
     tokio::select! {
         _ = async {
             loop {
-                accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept).await;
+                accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept, policy).await;
             }
         } => {},
         _ = signal::ctrl_c() => {

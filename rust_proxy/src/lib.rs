@@ -26,6 +26,11 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_DOWNLOAD_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64GB per-direction transfer cap (tunnel-friendly: scp/rsync over SSH)
 pub const STATS_FLUSH_THRESHOLD: u64 = 65536;
 
+/// Max request head. Raised from the original 8KB: browsers with large cookie
+/// jars and `Authorization: Bearer` tokens exceed 8KB routinely, and that was the
+/// likeliest source of spurious rewrite anomalies.
+pub const MAX_REQUEST_HEAD_SIZE: usize = 65536;
+
 // Statistics tracking
 #[derive(Debug)]
 pub struct ProxyStats {
@@ -271,7 +276,11 @@ fn analyze_ssl_error(host: &str, port: u16, error: &std::io::Error) {
     }
 }
 
-pub async fn handle_client(client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+pub async fn handle_client(
+    client_socket: TcpStream,
+    stats: Arc<ProxyStats>,
+    policy: crate::http_rewrite::RewritePolicy,
+) -> Result<(), ProxyError> {
     // Configure socket options for better performance
     client_socket.set_nodelay(true)?;
 
@@ -289,9 +298,10 @@ pub async fn handle_client(client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
     }
 
     let result = if peek_buf[0] == 0x05 {
+        // SOCKS5 is a blind byte relay: nothing to rewrite.
         handle_socks5(client_socket, stats.clone()).await
     } else {
-        handle_http(client_socket, stats.clone()).await
+        handle_http(client_socket, stats.clone(), policy).await
     };
 
     // Cleanup: decrement active connections counter
@@ -315,47 +325,105 @@ pub fn flush_rewrite_stats(
     }
 }
 
+/// What to do with an established upstream connection.
+///
+/// Replaces the old `forward_headers: bool` + `raw_headers: &[u8]` pair. That
+/// flag let a non-CONNECT request take the tunnel branch and receive a
+/// "200 Connection Established" it never asked for; as two variants the bug is
+/// unrepresentable.
+pub enum Upstream {
+    /// CONNECT: acknowledge to the client, then relay bytes blind both ways.
+    Tunnel,
+    /// Plain HTTP: rewrite this head, then every later head on the connection.
+    Http {
+        first_head: Vec<u8>,
+        policy: crate::http_rewrite::RewritePolicy,
+    },
+}
+
 async fn connect_and_tunnel(
     mut client_socket: TcpStream,
     host: &str,
     port: u16,
-    forward_headers: bool,
-    raw_headers: &[u8],
+    upstream: Upstream,
     on_error: impl FnOnce(&std::io::Error),
     stats: Arc<ProxyStats>,
 ) -> Result<(), ProxyError> {
     match timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
         Ok(Ok(mut remote)) => {
             debug!("Connected to {}:{}", host, port);
-            if forward_headers {
-                remote.set_nodelay(true)?;
-                remote.write_all(raw_headers).await?;
-            } else {
-                client_socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+            match upstream {
+                Upstream::Tunnel => {
+                    client_socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+                    tunnel_fast(client_socket, remote, None, host, stats).await
+                }
+                Upstream::Http { first_head, policy } => {
+                    remote.set_nodelay(true)?;
+
+                    let mut stream = crate::http_rewrite::RequestStream::new(
+                        policy,
+                        MAX_REQUEST_HEAD_SIZE,
+                    );
+                    let mut rewritten = Vec::with_capacity(first_head.len() + 64);
+                    let push_result = stream.push(&first_head, &mut rewritten);
+
+                    let fallback = policy == crate::http_rewrite::RewritePolicy::Fallback;
+                    flush_rewrite_stats(&mut stream, &stats, host, fallback);
+
+                    if let Err(anomaly) = push_result {
+                        // Nothing has gone upstream yet, so the client can still
+                        // be told. Mid-stream failures cannot be, which is why
+                        // the relay path just closes.
+                        warn!(
+                            "Rewrite anomaly '{}' on first request to {}:{} — refusing",
+                            anomaly.name(),
+                            host,
+                            port
+                        );
+                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                        client_socket
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            .await?;
+                        return Ok(());
+                    }
+
+                    remote.write_all(&rewritten).await?;
+                    tunnel_fast(client_socket, remote, Some(stream), host, stats).await
+                }
             }
-            tunnel_fast(client_socket, remote, None, host, stats).await
         }
         Ok(Err(e)) => {
             on_error(&e);
             stats.connection_errors.fetch_add(1, Ordering::Relaxed);
             warn!("Failed to connect to {}:{} - {}", host, port, e);
-            client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            client_socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
             Ok(())
         }
         Err(_) => {
             stats.connection_errors.fetch_add(1, Ordering::Relaxed);
             warn!("Timeout connecting to {}:{}", host, port);
-            client_socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            client_socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
             Ok(())
         }
     }
 }
 
-async fn handle_http(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+async fn handle_http(
+    mut client_socket: TcpStream,
+    stats: Arc<ProxyStats>,
+    policy: crate::http_rewrite::RewritePolicy,
+) -> Result<(), ProxyError> {
     // Read headers incrementally — no large upfront buffer
     let mut raw_headers = Vec::new();
     let mut small_buf = [0u8; 1024];
-    let max_header_size = 8192;
+    let max_header_size = MAX_REQUEST_HEAD_SIZE;
 
     loop {
         let n = timeout(CONNECT_TIMEOUT, client_socket.read(&mut small_buf))
@@ -390,19 +458,54 @@ async fn handle_http(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Re
         let (host, port) = parse_host_port(url, 443)?;
         stats.https_requests.fetch_add(1, Ordering::Relaxed);
         info!("HTTPS CONNECT request to {}:{}", host, port);
-        connect_and_tunnel(client_socket, host, port, false, &raw_headers, |e| analyze_ssl_error(host, port, e), stats).await?;
+        connect_and_tunnel(
+            client_socket,
+            host,
+            port,
+            Upstream::Tunnel,
+            |e| analyze_ssl_error(host, port, e),
+            stats,
+        )
+        .await?;
     } else {
         let parsed_url = Url::parse(url)?;
         let scheme = parsed_url.scheme();
         let host = parsed_url.host_str().ok_or("No host found")?;
-        let port = parsed_url.port().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let port = parsed_url
+            .port()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+        if scheme != "http" {
+            // The old code passed forward_headers=false here, which sent the
+            // client a "200 Connection Established" it never requested. This
+            // proxy cannot originate TLS, so absolute-form https is unsupported;
+            // clients wanting TLS must use CONNECT. 502 rather than a new status
+            // string, to avoid adding a client-facing response shape.
+            warn!(
+                "Unsupported absolute-form scheme '{}' for {}:{}",
+                scheme, host, port
+            );
+            stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+            client_socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+
         stats.http_requests.fetch_add(1, Ordering::Relaxed);
         info!("HTTP {} request to {}://{}:{}", method, scheme, host, port);
-        connect_and_tunnel(client_socket, host, port, scheme == "http", &raw_headers, |e| {
-            if scheme == "https" {
-                analyze_ssl_error(host, port, e);
-            }
-        }, stats).await?;
+        connect_and_tunnel(
+            client_socket,
+            host,
+            port,
+            Upstream::Http {
+                first_head: raw_headers.clone(),
+                policy,
+            },
+            |_e| {},
+            stats,
+        )
+        .await?;
     }
 
     Ok(())
@@ -778,6 +881,8 @@ where
                     Transformed::Replaced(bytes) => bytes,
                 };
                 if payload.is_empty() {
+                    // Intended: an empty `Transformed::Replaced(vec![])` means
+                    // "swallow this chunk" (no write, no FIN). Not a lost flush.
                     continue;
                 }
 
