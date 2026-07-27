@@ -1985,17 +1985,159 @@ git commit -m "feat: add --rewrite-fallback flag, off by default"
 
 ---
 
-### Task 8: Wire the rewriter into `handle_http`, and fix the `https://` bug
+### Task 8: Socket timers face the client, not the origin
 
 **Files:**
-- Modify: `rust_proxy/src/lib.rs:17-22` (consts), `lib.rs:180-206` (`handle_client`), `lib.rs:208-242` (`connect_and_tunnel`), `lib.rs:244-299` (`handle_http`), `lib.rs:302` (`handle_socks5` call site)
-- Modify: `rust_proxy/src/http_rewrite.rs` (add `take_sanitized`)
-- Modify: `rust_proxy/src/main.rs:7-30`, `main.rs:60-79`
+- Modify: `rust_proxy/src/lib.rs:419-446` (Unix), `lib.rs:448-482` (Windows), `lib.rs:487` (call site)
 
 **Interfaces:**
-- Consumes: `RequestStream`, `RewritePolicy`, `RewriteAnomaly` (Tasks 1-5); `ProxyStats::record_sanitized`, `record_anomaly`, `set_fallback_active` (Task 6); `Args::rewrite_policy` (Task 7).
-- Produces: `MAX_REQUEST_HEAD_SIZE: usize`; `Upstream { Tunnel, Http { first_head: Vec<u8>, policy: RewritePolicy } }`; `flush_rewrite_stats(&mut RequestStream, &ProxyStats, &str, bool)`; `handle_client(TcpStream, Arc<ProxyStats>, RewritePolicy)`. Task 10 changes `tunnel_fast`, which this task calls.
-- **Note:** at the end of this task `tunnel_fast` still takes `(src, dst, stats)`. Task 10 changes it. Use the temporary call shape shown in Step 5 so the tree compiles between tasks.
+- Consumes: nothing.
+- Produces: `configure_client_socket(client: &TcpStream)`, replacing `configure_keepalive(src, dst)`. Task 9 calls it.
+
+**Why:** `configure_keepalive(&src, &dst)` applies identical settings to both sockets, so `TCP_KEEPIDLE=60` with a 1s probe interval and `TCP_USER_TIMEOUT=10_000` currently face the **origin**. A 10-second user timeout resets a briefly-stalled origin where a normal client waits minutes — measurable from the origin side. The origin-facing socket should inherit OS defaults.
+
+- [ ] **Step 1: Rename and narrow the Unix implementation**
+
+In `rust_proxy/src/lib.rs`, replace the Unix `configure_keepalive` (`lib.rs:424-446`) with:
+
+```rust
+/// Tune the **client-facing** socket only.
+///
+/// The origin-facing socket deliberately inherits OS defaults: these values are
+/// far from default and are observable from the origin side. Accepted cost is
+/// slower dead-origin detection — establishment is still bounded by
+/// `CONNECT_TIMEOUT` and stalls by `IDLE_TIMEOUT`. Waiting minutes on a stalled
+/// peer is what a normal client does, so the fingerprint fix and the correct
+/// behavior coincide.
+#[cfg(unix)]
+fn configure_client_socket(client: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+
+    fn set_sock(fd: i32, level: i32, opt: i32, val: i32) {
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                &val as *const _ as *const _,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+    }
+
+    let fd = client.as_raw_fd();
+    let one = 1i32;
+    set_sock(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
+    set_sock(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+    set_sock(fd, libc::IPPROTO_TCP, TCP_QUICKACK, one);
+    set_sock(fd, libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
+}
+```
+
+- [ ] **Step 2: Rename and narrow the Windows implementation**
+
+In `rust_proxy/src/lib.rs`, replace the Windows `configure_keepalive` (`lib.rs:448-482`) with:
+
+```rust
+/// Tune the **client-facing** socket only. See the Unix variant for rationale.
+#[cfg(windows)]
+fn configure_client_socket(client: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct TcpKeepalive {
+        onoff: u32,
+        keepalivetime: u32,
+        keepaliveinterval: u32,
+    }
+
+    const SIO_KEEPALIVE_VALS: u32 = 0xFC000006;
+
+    let ka = TcpKeepalive {
+        onoff: 1,
+        keepalivetime: 60000,
+        keepaliveinterval: 1000,
+    };
+
+    fn set_keepalive(socket: winapi::um::winsock2::SOCKET, ka: &TcpKeepalive) {
+        let _ = unsafe {
+            let mut ret = 0;
+            winapi::um::winsock2::WSAIoctl(
+                socket,
+                SIO_KEEPALIVE_VALS,
+                ka as *const _ as *mut _,
+                std::mem::size_of::<TcpKeepalive>() as _,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+    }
+
+    set_keepalive(client.as_raw_socket() as _, &ka);
+}
+```
+
+- [ ] **Step 3: Update the call site**
+
+In `rust_proxy/src/lib.rs`, change `tunnel_fast`'s line 487 from:
+
+```rust
+    configure_keepalive(&src, &dst);
+```
+
+to:
+
+```rust
+    // `src` is the client; `dst` is the origin and keeps OS defaults.
+    configure_client_socket(&src);
+```
+
+Note `dst.set_nodelay(true)` on line 486 **stays**. Browsers and `curl` also disable Nagle, so it is fingerprint-neutral and load-bearing for latency.
+
+- [ ] **Step 4: Verify no caller passes the origin socket**
+
+Run: `rg -n 'configure_keepalive|configure_client_socket' rust_proxy/src/`
+Expected: exactly three matches — the two `configure_client_socket` definitions and the single call site. No occurrence of `configure_keepalive` remains, and no call passes two sockets. The function signature taking one socket is itself the guard; there is no portable way to assert `setsockopt` state from userspace, so a flaky `ss`-parsing test is not worth writing.
+
+- [ ] **Step 5: Verify the build and suite on this platform**
+
+Run: `cargo build && cargo test`
+Expected: builds clean, all tests pass.
+
+- [ ] **Step 6: Verify the Windows variant still compiles**
+
+Run: `cargo check --target x86_64-pc-windows-gnu`
+Expected: success. If that target is not installed, skip it and note that CI's Windows job (`.github/workflows/release.yml:14-33`) covers it.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add rust_proxy/src/lib.rs
+git commit -m "fix: apply non-default TCP timers to the client socket only
+
+The origin-facing socket inherited a 60s keepalive with 1s probes and a 10s
+TCP_USER_TIMEOUT, both far from OS defaults and observable from the origin."
+```
+
+---
+
+### Task 9: Asymmetric relay plumbing (pure refactor)
+
+Introduces the machinery for a rewriting relay **without changing behavior**: every call site passes `None`, so the proxy still relays blind exactly as before. Task 10 flips the plain-HTTP path to `Some(stream)`.
+
+**Files:**
+- Modify: `rust_proxy/src/http_rewrite.rs` (add `take_sanitized`, `is_fallback`)
+- Modify: `rust_proxy/src/lib.rs:484-506` (`tunnel_fast`), `lib.rs:508-574` (`bounded_copy_with_stats`), and the two existing `tunnel_fast` call sites
+
+**Interfaces:**
+- Consumes: `RequestStream` (Tasks 4-5); `ProxyStats::record_sanitized` / `record_anomaly` (Task 6); `configure_client_socket` (Task 8).
+- Produces: `Transformed`; private `copy_loop`; `RewriteShared`; `flush_rewrite_stats(&mut RequestStream, &ProxyStats, &str, bool)`; `tunnel_fast(src, dst, rewrite: Option<RequestStream>, host: &str, stats)`; `RequestStream::take_sanitized()`; `RequestStream::is_fallback()`. Task 10 supplies `Some(stream)`.
+- `bounded_copy_with_stats` keeps its exact public signature — `tests/unit_tests.rs:209-300` depends on it.
+
+**Verification approach:** this task adds no new tests deliberately. It is a behavior-preserving refactor, so the gate is that the **existing** suite still passes unchanged — especially `bounded_copy_with_stats` (`tests/unit_tests.rs:209-300`), CONNECT (`tests/integration_tests.rs:76-115`), and SOCKS5 (`tests/integration_tests.rs:117-307`). The behavioral tests for rewriting arrive in Task 10, which is where the behavior arrives.
 
 - [ ] **Step 1: Add the drain accessor**
 
@@ -2041,10 +2183,497 @@ and change the cumulative accessor to read the total:
     }
 ```
 
-- [ ] **Step 2: Confirm Task 4 and 5 tests still pass**
+- [ ] **Step 2: Confirm the Task 4 and 5 tests still pass**
 
 Run: `cargo test --test http_rewrite_tests`
 Expected: PASS, 46 passed — `sanitized_request_count_tracks_successful_rewrites` still sees the cumulative 2.
+
+- [ ] **Step 3: Expose the policy on `RequestStream`**
+
+In `rust_proxy/src/http_rewrite.rs`, add to `impl RequestStream`:
+
+```rust
+    pub fn is_fallback(&self) -> bool {
+        self.policy == RewritePolicy::Fallback
+    }
+```
+
+- [ ] **Step 4: Add the stats flush helper**
+
+In `rust_proxy/src/lib.rs`, insert immediately before `async fn connect_and_tunnel` (`lib.rs:208`):
+
+```rust
+/// Move counters out of a `RequestStream` and into `ProxyStats`.
+///
+/// `forwarded` marks a real leak: only fallback-eligible anomalies under
+/// `--rewrite-fallback` actually put unrewritten bytes on the wire.
+pub fn flush_rewrite_stats(
+    stream: &mut crate::http_rewrite::RequestStream,
+    stats: &ProxyStats,
+    host: &str,
+    fallback: bool,
+) {
+    stats.record_sanitized(stream.take_sanitized());
+    for anomaly in stream.take_anomalies() {
+        stats.record_anomaly(anomaly, host, fallback && anomaly.fallback_eligible());
+    }
+}
+```
+
+- [ ] **Step 5: Extract a hooked copy loop**
+
+In `rust_proxy/src/lib.rs`, replace `bounded_copy_with_stats` (`lib.rs:508-574`) with the following. Behavior is unchanged; the loop body is now shared with the rewriting and observing paths so there is one place where idle timeout, byte caps, and stats accounting live.
+
+```rust
+/// What a copy hook decided to do with a chunk.
+pub enum Transformed {
+    /// Write the input bytes through unchanged.
+    Verbatim,
+    /// Write these bytes instead (possibly empty).
+    Replaced(Vec<u8>),
+}
+
+/// Shared copy loop: idle timeout, byte cap, stats flushing, FIN propagation.
+async fn copy_loop<R, W, F>(
+    mut reader: R,
+    mut writer: W,
+    max_size: u64,
+    idle_timeout: Duration,
+    direction: &str,
+    stats: Arc<ProxyStats>,
+    mut hook: F,
+) -> Result<(), ProxyError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+    F: FnMut(&[u8]) -> Result<Transformed, ProxyError>,
+{
+    let mut bytes_read = 0u64;
+    let mut last_flushed = 0u64;
+    let mut buffer = vec![0; BUFFER_SIZE];
+
+    loop {
+        let read_result = timeout(idle_timeout, reader.read(&mut buffer)).await;
+
+        match read_result {
+            Ok(Ok(0)) => {
+                writer.shutdown().await.ok();
+                break;
+            }
+            Ok(Ok(n)) => {
+                bytes_read += n as u64;
+                if (bytes_read - last_flushed) >= STATS_FLUSH_THRESHOLD {
+                    stats
+                        .bytes_transferred
+                        .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
+                    last_flushed = bytes_read;
+                }
+
+                if bytes_read > max_size {
+                    warn!("Download size limit exceeded: {} bytes", bytes_read);
+                    return Err("Download size limit exceeded".into());
+                }
+
+                let transformed = hook(&buffer[..n])?;
+                let payload: &[u8] = match &transformed {
+                    Transformed::Verbatim => &buffer[..n],
+                    Transformed::Replaced(bytes) => bytes,
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+
+                let write_result = timeout(idle_timeout, writer.write_all(payload)).await;
+                match write_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        debug!("Write error in {}: {}", direction, e);
+                        return Err("Write error".into());
+                    }
+                    Err(_) => {
+                        warn!("Write timeout in {}", direction);
+                        return Err("Write timeout".into());
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                debug!("Read error in {}: {}", direction, e);
+                return Err(e.into());
+            }
+            Err(_) => {
+                warn!("Connection idle timeout in {}", direction);
+                return Err("Idle timeout".into());
+            }
+        }
+    }
+
+    if bytes_read > last_flushed {
+        stats
+            .bytes_transferred
+            .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
+    }
+
+    Ok(())
+}
+
+// Copy with size limits and statistics tracking.
+pub async fn bounded_copy_with_stats<R, W>(
+    reader: R,
+    writer: W,
+    max_size: u64,
+    idle_timeout: Duration,
+    direction: &str,
+    stats: Arc<ProxyStats>,
+) -> Result<(), ProxyError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    copy_loop(
+        reader,
+        writer,
+        max_size,
+        idle_timeout,
+        direction,
+        stats,
+        |_| Ok(Transformed::Verbatim),
+    )
+    .await
+}
+```
+
+- [ ] **Step 6: Add the shared rewriter state**
+
+In `rust_proxy/src/lib.rs`, insert immediately before `tunnel_fast` (`lib.rs:484`):
+
+```rust
+/// Rewriter state shared by the two halves of a plain-HTTP relay.
+///
+/// A `std::sync::Mutex` is correct here: it is only ever held for a synchronous
+/// state-machine step, never across an await. `upgrade_watch` lets the response
+/// half skip locking entirely, which keeps it a blind relay for all normal
+/// traffic — the lock is touched only while an upgrade offer is outstanding.
+struct RewriteShared {
+    stream: Mutex<crate::http_rewrite::RequestStream>,
+    upgrade_watch: AtomicBool,
+}
+```
+
+- [ ] **Step 7: Make `tunnel_fast` asymmetric**
+
+In `rust_proxy/src/lib.rs`, replace `tunnel_fast` (`lib.rs:484-506`) with:
+
+```rust
+async fn tunnel_fast(
+    mut src: TcpStream,
+    mut dst: TcpStream,
+    rewrite: Option<crate::http_rewrite::RequestStream>,
+    host: &str,
+    stats: Arc<ProxyStats>,
+) -> Result<(), ProxyError> {
+    src.set_nodelay(true)?;
+    dst.set_nodelay(true)?;
+    configure_client_socket(&src);
+
+    let (mut src_reader, mut src_writer) = src.split();
+    let (mut dst_reader, mut dst_writer) = dst.split();
+
+    match rewrite {
+        // CONNECT and SOCKS5: opaque both ways, zero parsing cost.
+        None => {
+            let client_to_server = bounded_copy_with_stats(
+                &mut src_reader,
+                &mut dst_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "client->server",
+                stats.clone(),
+            );
+            let server_to_client = bounded_copy_with_stats(
+                &mut dst_reader,
+                &mut src_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "server->client",
+                stats.clone(),
+            );
+            tokio::try_join!(client_to_server, server_to_client)?;
+        }
+        Some(stream) => {
+            let fallback = stream.is_fallback();
+            let shared = Arc::new(RewriteShared {
+                stream: Mutex::new(stream),
+                upgrade_watch: AtomicBool::new(false),
+            });
+
+            let out_shared = shared.clone();
+            let out_stats = stats.clone();
+            let out_host = host.to_string();
+            let client_to_server = copy_loop(
+                &mut src_reader,
+                &mut dst_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "client->server",
+                stats.clone(),
+                move |chunk| {
+                    let mut rewritten = Vec::with_capacity(chunk.len() + 64);
+                    let mut guard = out_shared
+                        .stream
+                        .lock()
+                        .map_err(|_| ProxyError::from("rewriter lock poisoned"))?;
+                    let result = guard.push(chunk, &mut rewritten);
+                    flush_rewrite_stats(&mut guard, &out_stats, &out_host, fallback);
+                    out_shared
+                        .upgrade_watch
+                        .store(guard.upgrade_offered(), Ordering::Relaxed);
+                    drop(guard);
+
+                    if let Err(anomaly) = result {
+                        // Mid-stream, so no status line can be injected; closing
+                        // is the only option that does not leak.
+                        warn!(
+                            "Rewrite anomaly '{}' for {} — closing connection",
+                            anomaly.name(),
+                            out_host
+                        );
+                        return Err(ProxyError::from("rewrite anomaly"));
+                    }
+                    Ok(Transformed::Replaced(rewritten))
+                },
+            );
+
+            let in_shared = shared.clone();
+            let server_to_client = copy_loop(
+                &mut dst_reader,
+                &mut src_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "server->client",
+                stats.clone(),
+                move |chunk| {
+                    // One atomic load in the common case; no lock, no copy.
+                    if in_shared.upgrade_watch.load(Ordering::Relaxed) {
+                        if let Ok(mut guard) = in_shared.stream.lock() {
+                            guard.observe_response(chunk);
+                            if !guard.upgrade_offered() {
+                                in_shared.upgrade_watch.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Ok(Transformed::Verbatim)
+                },
+            );
+
+            tokio::try_join!(client_to_server, server_to_client)?;
+        }
+    }
+
+    Ok(())
+}
+```
+
+- [ ] **Step 8: Update both existing call sites to pass `None`**
+
+`connect_and_tunnel` still has its original signature at this point; only the `tunnel_fast` call changes. In `rust_proxy/src/lib.rs`, change the call inside `connect_and_tunnel` from:
+
+```rust
+            tunnel_fast(client_socket, remote, stats).await
+```
+
+to:
+
+```rust
+            tunnel_fast(client_socket, remote, None, host, stats).await
+```
+
+In `handle_socks5`, change its `tunnel_fast` call to:
+
+```rust
+    tunnel_fast(client_socket, remote, None, host.as_str(), stats).await
+```
+
+- [ ] **Step 9: Verify nothing changed behaviorally**
+
+Run: `cargo test`
+Expected: all pre-existing tests pass with no modifications. Since every caller passes `None`, the `Some(..)` arm is not yet exercised — that is intentional and Task 10 covers it.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add rust_proxy/src/lib.rs rust_proxy/src/http_rewrite.rs
+git commit -m "refactor: add rewriting-relay plumbing behind an Option
+
+Extracts the shared copy loop, adds the asymmetric tunnel_fast shape and the
+stats flush helper. Every call site still passes None, so behavior is
+unchanged; Task 10 enables rewriting on the plain-HTTP path."
+```
+
+---
+
+### Task 10: Wire the rewriter into `handle_http`, and fix the `https://` bug
+
+Turns on everything Task 9 built. This is where the privacy behavior actually starts.
+
+**Files:**
+- Modify: `rust_proxy/src/lib.rs:17-22` (consts), `lib.rs:180-206` (`handle_client`), `lib.rs:208-242` (`connect_and_tunnel`), `lib.rs:244-299` (`handle_http`)
+- Modify: `rust_proxy/src/main.rs:7-30`, `main.rs:60-79`
+- Create: `rust_proxy/tests/relay_tests.rs`
+
+**Interfaces:**
+- Consumes: `tunnel_fast`, `flush_rewrite_stats` (Task 9); `RequestStream`, `RewritePolicy`, `RewriteAnomaly` (Tasks 1-5); `ProxyStats::set_fallback_active` (Task 6); `Args::rewrite_policy` (Task 7).
+- Produces: `MAX_REQUEST_HEAD_SIZE: usize`; `Upstream { Tunnel, Http { first_head: Vec<u8>, policy: RewritePolicy } }`; `handle_client(TcpStream, Arc<ProxyStats>, RewritePolicy)`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `rust_proxy/tests/relay_tests.rs`:
+
+```rust
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+use rust_proxy::http_rewrite::RewritePolicy;
+use rust_proxy::{handle_client, Ordering, ProxyStats};
+
+/// Origin that records the exact bytes it receives, then replies.
+async fn recording_origin(listener: TcpListener) -> Vec<u8> {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let n = match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        received.extend_from_slice(&buf[..n]);
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        if received.windows(4).any(|w| w == b"\r\n\r\n") {
+            // Give a pipelined second request a chance to arrive.
+            let mut extra = [0u8; 4096];
+            if let Ok(Ok(m)) = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                socket.read(&mut extra),
+            )
+            .await
+            {
+                if m > 0 {
+                    received.extend_from_slice(&extra[..m]);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+            break;
+        }
+    }
+    received
+}
+
+/// Run one client byte-stream through a real proxy connection and return what
+/// the origin actually received.
+async fn proxy_roundtrip(client_bytes: &[u8], policy: RewritePolicy) -> (Vec<u8>, Arc<ProxyStats>) {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let origin_task = tokio::spawn(recording_origin(origin));
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let stats = Arc::new(ProxyStats::new());
+    let stats_for_proxy = stats.clone();
+
+    tokio::spawn(async move {
+        let (socket, _) = proxy.accept().await.unwrap();
+        let _ = handle_client(socket, stats_for_proxy, policy).await;
+    });
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = String::from_utf8_lossy(client_bytes)
+        .replace("ORIGIN", &origin_addr.to_string())
+        .into_bytes();
+    client.write_all(&request).await.unwrap();
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut response),
+    )
+    .await;
+
+    let received = origin_task.await.unwrap();
+    (received, stats)
+}
+
+#[tokio::test]
+async fn origin_never_sees_absolute_form() {
+    let (received, stats) = proxy_roundtrip(
+        b"GET http://ORIGIN/path?q=1 HTTP/1.1\r\nHost: ORIGIN\r\nAccept: */*\r\n\r\n",
+        RewritePolicy::FailClosed,
+    )
+    .await;
+
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.starts_with("GET /path?q=1 HTTP/1.1\r\n"),
+        "origin got: {text:?}"
+    );
+    assert!(!text.contains("http://"), "absolute form leaked: {text:?}");
+    assert_eq!(stats.requests_sanitized.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn origin_never_sees_proxy_headers() {
+    let (received, _) = proxy_roundtrip(
+        b"GET http://ORIGIN/ HTTP/1.1\r\nHost: ORIGIN\r\n\
+          Proxy-Connection: keep-alive\r\nProxy-Authorization: Basic zzz\r\n\r\n",
+        RewritePolicy::FailClosed,
+    )
+    .await;
+
+    let lowered = String::from_utf8_lossy(&received).to_lowercase();
+    assert!(!lowered.contains("proxy-connection"), "{lowered:?}");
+    assert!(!lowered.contains("proxy-authorization"), "{lowered:?}");
+    assert!(lowered.contains("connection: keep-alive"), "{lowered:?}");
+}
+
+#[tokio::test]
+async fn second_pipelined_request_is_also_rewritten() {
+    // The whole reason for a streaming rewriter rather than a one-shot.
+    let (received, _) = proxy_roundtrip(
+        b"GET http://ORIGIN/one HTTP/1.1\r\nHost: ORIGIN\r\n\r\n\
+          GET http://ORIGIN/two HTTP/1.1\r\nHost: ORIGIN\r\n\r\n",
+        RewritePolicy::FailClosed,
+    )
+    .await;
+
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.contains("GET /one HTTP/1.1"), "{text:?}");
+    assert!(text.contains("GET /two HTTP/1.1"), "{text:?}");
+    assert!(!text.contains("http://"), "absolute form leaked: {text:?}");
+}
+
+#[tokio::test]
+async fn proxy_never_injects_identifying_headers() {
+    let (received, _) = proxy_roundtrip(
+        b"GET http://ORIGIN/ HTTP/1.1\r\nHost: ORIGIN\r\n\r\n",
+        RewritePolicy::FailClosed,
+    )
+    .await;
+
+    let lowered = String::from_utf8_lossy(&received).to_lowercase();
+    for banned in ["via:", "x-forwarded-for", "forwarded:", "x-real-ip"] {
+        assert!(!lowered.contains(banned), "{banned} present in {lowered:?}");
+    }
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --test relay_tests`
+Expected: FAIL to compile — `handle_client` takes 2 arguments, not 3. After Step 7 it compiles, and before Step 5 the pipelined case still fails.
 
 - [ ] **Step 3: Add the head-size constant**
 
@@ -2057,9 +2686,9 @@ In `rust_proxy/src/lib.rs`, add after line 22 (`pub const STATS_FLUSH_THRESHOLD`
 pub const MAX_REQUEST_HEAD_SIZE: usize = 65536;
 ```
 
-- [ ] **Step 4: Add the `Upstream` enum and the stats flush helper**
+- [ ] **Step 4: Add the `Upstream` enum**
 
-In `rust_proxy/src/lib.rs`, insert immediately before `async fn connect_and_tunnel` (`lib.rs:208`):
+In `rust_proxy/src/lib.rs`, insert immediately before `async fn connect_and_tunnel` (`lib.rs:208`), next to `flush_rewrite_stats` from Task 9:
 
 ```rust
 /// What to do with an established upstream connection.
@@ -2117,8 +2746,7 @@ async fn connect_and_tunnel(
                     client_socket
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await?;
-                    // TODO(Task 10): pass `None` for the rewriter.
-                    tunnel_fast(client_socket, remote, stats).await
+                    tunnel_fast(client_socket, remote, None, host, stats).await
                 }
                 Upstream::Http { first_head, policy } => {
                     remote.set_nodelay(true)?;
@@ -2136,7 +2764,7 @@ async fn connect_and_tunnel(
                     if let Err(anomaly) = push_result {
                         // Nothing has gone upstream yet, so the client can still
                         // be told. Mid-stream failures cannot be, which is why
-                        // Task 10's path just closes.
+                        // the relay path just closes.
                         warn!(
                             "Rewrite anomaly '{}' on first request to {}:{} — refusing",
                             anomaly.name(),
@@ -2151,8 +2779,7 @@ async fn connect_and_tunnel(
                     }
 
                     remote.write_all(&rewritten).await?;
-                    // TODO(Task 10): pass `Some(stream)` and `host`.
-                    tunnel_fast(client_socket, remote, stats).await
+                    tunnel_fast(client_socket, remote, Some(stream), host, stats).await
                 }
             }
         }
@@ -2321,628 +2948,25 @@ and change the accept call (`main.rs:92`) to:
                 accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept, policy).await;
 ```
 
-- [ ] **Step 9: Verify it builds and all tests pass**
-
-Run: `cargo build && cargo test`
-Expected: builds clean; all tests pass. `tests/integration_tests.rs:31-74` still gets a `200 OK` through the proxy, now with the request rewritten to origin form.
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add rust_proxy/src/lib.rs rust_proxy/src/main.rs rust_proxy/src/http_rewrite.rs
-git commit -m "feat: rewrite plain-HTTP requests before forwarding upstream
-
-Replaces connect_and_tunnel's forward_headers flag with an Upstream enum,
-making the https-absolute-form bug unrepresentable, and raises the request
-head cap to 64KB."
-```
-
----
-
-### Task 9: Socket timers face the client, not the origin
-
-**Files:**
-- Modify: `rust_proxy/src/lib.rs:419-446` (Unix), `lib.rs:448-482` (Windows), `lib.rs:487` (call site)
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces: `configure_client_socket(client: &TcpStream)`, replacing `configure_keepalive(src, dst)`. Task 10 calls it.
-
-**Why:** `configure_keepalive(&src, &dst)` applies identical settings to both sockets, so `TCP_KEEPIDLE=60` with a 1s probe interval and `TCP_USER_TIMEOUT=10_000` currently face the **origin**. A 10-second user timeout resets a briefly-stalled origin where a normal client waits minutes — measurable from the origin side. The origin-facing socket should inherit OS defaults.
-
-- [ ] **Step 1: Rename and narrow the Unix implementation**
-
-In `rust_proxy/src/lib.rs`, replace the Unix `configure_keepalive` (`lib.rs:424-446`) with:
-
-```rust
-/// Tune the **client-facing** socket only.
-///
-/// The origin-facing socket deliberately inherits OS defaults: these values are
-/// far from default and are observable from the origin side. Accepted cost is
-/// slower dead-origin detection — establishment is still bounded by
-/// `CONNECT_TIMEOUT` and stalls by `IDLE_TIMEOUT`. Waiting minutes on a stalled
-/// peer is what a normal client does, so the fingerprint fix and the correct
-/// behavior coincide.
-#[cfg(unix)]
-fn configure_client_socket(client: &TcpStream) {
-    use std::os::unix::io::AsRawFd;
-
-    fn set_sock(fd: i32, level: i32, opt: i32, val: i32) {
-        let _ = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                opt,
-                &val as *const _ as *const _,
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-    }
-
-    let fd = client.as_raw_fd();
-    let one = 1i32;
-    set_sock(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
-    set_sock(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
-    set_sock(fd, libc::IPPROTO_TCP, TCP_QUICKACK, one);
-    set_sock(fd, libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
-}
-```
-
-- [ ] **Step 2: Rename and narrow the Windows implementation**
-
-In `rust_proxy/src/lib.rs`, replace the Windows `configure_keepalive` (`lib.rs:448-482`) with:
-
-```rust
-/// Tune the **client-facing** socket only. See the Unix variant for rationale.
-#[cfg(windows)]
-fn configure_client_socket(client: &TcpStream) {
-    use std::os::windows::io::AsRawSocket;
-
-    #[repr(C)]
-    struct TcpKeepalive {
-        onoff: u32,
-        keepalivetime: u32,
-        keepaliveinterval: u32,
-    }
-
-    const SIO_KEEPALIVE_VALS: u32 = 0xFC000006;
-
-    let ka = TcpKeepalive {
-        onoff: 1,
-        keepalivetime: 60000,
-        keepaliveinterval: 1000,
-    };
-
-    fn set_keepalive(socket: winapi::um::winsock2::SOCKET, ka: &TcpKeepalive) {
-        let _ = unsafe {
-            let mut ret = 0;
-            winapi::um::winsock2::WSAIoctl(
-                socket,
-                SIO_KEEPALIVE_VALS,
-                ka as *const _ as *mut _,
-                std::mem::size_of::<TcpKeepalive>() as _,
-                std::ptr::null_mut(),
-                0,
-                &mut ret,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-    }
-
-    set_keepalive(client.as_raw_socket() as _, &ka);
-}
-```
-
-- [ ] **Step 3: Update the call site**
-
-In `rust_proxy/src/lib.rs`, change `tunnel_fast`'s line 487 from:
-
-```rust
-    configure_keepalive(&src, &dst);
-```
-
-to:
-
-```rust
-    // `src` is the client; `dst` is the origin and keeps OS defaults.
-    configure_client_socket(&src);
-```
-
-Note `dst.set_nodelay(true)` on line 486 **stays**. Browsers and `curl` also disable Nagle, so it is fingerprint-neutral and load-bearing for latency.
-
-- [ ] **Step 4: Verify no caller passes the origin socket**
-
-Run: `rg -n 'configure_keepalive|configure_client_socket' rust_proxy/src/`
-Expected: exactly three matches — the two `configure_client_socket` definitions and the single call site. No occurrence of `configure_keepalive` remains, and no call passes two sockets. The function signature taking one socket is itself the guard; there is no portable way to assert `setsockopt` state from userspace, so a flaky `ss`-parsing test is not worth writing.
-
-- [ ] **Step 5: Verify the build and suite on this platform**
-
-Run: `cargo build && cargo test`
-Expected: builds clean, all tests pass.
-
-- [ ] **Step 6: Verify the Windows variant still compiles**
-
-Run: `cargo check --target x86_64-pc-windows-gnu`
-Expected: success. If that target is not installed, skip it and note that CI's Windows job (`.github/workflows/release.yml:14-33`) covers it.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add rust_proxy/src/lib.rs
-git commit -m "fix: apply non-default TCP timers to the client socket only
-
-The origin-facing socket inherited a 60s keepalive with 1s probes and a 10s
-TCP_USER_TIMEOUT, both far from OS defaults and observable from the origin."
-```
-
----
-
-### Task 10: Asymmetric relay — rewrite outbound, blind-relay inbound
-
-**Files:**
-- Modify: `rust_proxy/src/lib.rs:484-506` (`tunnel_fast`), `lib.rs:508-574` (`bounded_copy_with_stats`), and the two `tunnel_fast` call sites from Task 8
-- Create: `rust_proxy/tests/relay_tests.rs`
-
-**Interfaces:**
-- Consumes: `Upstream`, `flush_rewrite_stats` (Task 8); `RequestStream` (Tasks 4-5).
-- Produces: `RewriteShared`; `tunnel_fast(src, dst, rewrite: Option<RequestStream>, host: &str, stats)`; private `copy_loop`. `bounded_copy_with_stats` keeps its exact public signature — `tests/unit_tests.rs:209-300` depends on it.
-
-- [ ] **Step 1: Write the failing tests**
-
-Create `rust_proxy/tests/relay_tests.rs`:
-
-```rust
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use rust_proxy::http_rewrite::RewritePolicy;
-use rust_proxy::{handle_client, Ordering, ProxyStats};
-
-/// Origin that records the exact bytes it receives, then replies.
-async fn recording_origin(listener: TcpListener) -> Vec<u8> {
-    let (mut socket, _) = listener.accept().await.unwrap();
-    let mut received = Vec::new();
-    let mut buf = [0u8; 4096];
-
-    loop {
-        let n = match socket.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        received.extend_from_slice(&buf[..n]);
-        let _ = socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        if received.windows(4).any(|w| w == b"\r\n\r\n") {
-            // Give a pipelined second request a chance to arrive.
-            let mut extra = [0u8; 4096];
-            if let Ok(Ok(m)) = tokio::time::timeout(
-                std::time::Duration::from_millis(300),
-                socket.read(&mut extra),
-            )
-            .await
-            {
-                if m > 0 {
-                    received.extend_from_slice(&extra[..m]);
-                    let _ = socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                        .await;
-                }
-            }
-            break;
-        }
-    }
-    received
-}
-
-/// Run one client byte-stream through a real proxy connection and return what
-/// the origin actually received.
-async fn proxy_roundtrip(client_bytes: &[u8], policy: RewritePolicy) -> (Vec<u8>, Arc<ProxyStats>) {
-    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_addr = origin.local_addr().unwrap();
-    let origin_task = tokio::spawn(recording_origin(origin));
-
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy.local_addr().unwrap();
-    let stats = Arc::new(ProxyStats::new());
-    let stats_for_proxy = stats.clone();
-
-    tokio::spawn(async move {
-        let (socket, _) = proxy.accept().await.unwrap();
-        let _ = handle_client(socket, stats_for_proxy, policy).await;
-    });
-
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    let request = String::from_utf8_lossy(client_bytes)
-        .replace("ORIGIN", &origin_addr.to_string())
-        .into_bytes();
-    client.write_all(&request).await.unwrap();
-
-    let mut response = Vec::new();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.read_to_end(&mut response),
-    )
-    .await;
-
-    let received = origin_task.await.unwrap();
-    (received, stats)
-}
-
-#[tokio::test]
-async fn origin_never_sees_absolute_form() {
-    let (received, stats) = proxy_roundtrip(
-        b"GET http://ORIGIN/path?q=1 HTTP/1.1\r\nHost: ORIGIN\r\nAccept: */*\r\n\r\n",
-        RewritePolicy::FailClosed,
-    )
-    .await;
-
-    let text = String::from_utf8_lossy(&received);
-    assert!(
-        text.starts_with("GET /path?q=1 HTTP/1.1\r\n"),
-        "origin got: {text:?}"
-    );
-    assert!(!text.contains("http://"), "absolute form leaked: {text:?}");
-    assert_eq!(stats.requests_sanitized.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn origin_never_sees_proxy_headers() {
-    let (received, _) = proxy_roundtrip(
-        b"GET http://ORIGIN/ HTTP/1.1\r\nHost: ORIGIN\r\n\
-          Proxy-Connection: keep-alive\r\nProxy-Authorization: Basic zzz\r\n\r\n",
-        RewritePolicy::FailClosed,
-    )
-    .await;
-
-    let lowered = String::from_utf8_lossy(&received).to_lowercase();
-    assert!(!lowered.contains("proxy-connection"), "{lowered:?}");
-    assert!(!lowered.contains("proxy-authorization"), "{lowered:?}");
-    assert!(lowered.contains("connection: keep-alive"), "{lowered:?}");
-}
-
-#[tokio::test]
-async fn second_pipelined_request_is_also_rewritten() {
-    // The whole reason for a streaming rewriter rather than a one-shot.
-    let (received, _) = proxy_roundtrip(
-        b"GET http://ORIGIN/one HTTP/1.1\r\nHost: ORIGIN\r\n\r\n\
-          GET http://ORIGIN/two HTTP/1.1\r\nHost: ORIGIN\r\n\r\n",
-        RewritePolicy::FailClosed,
-    )
-    .await;
-
-    let text = String::from_utf8_lossy(&received);
-    assert!(text.contains("GET /one HTTP/1.1"), "{text:?}");
-    assert!(text.contains("GET /two HTTP/1.1"), "{text:?}");
-    assert!(!text.contains("http://"), "absolute form leaked: {text:?}");
-}
-
-#[tokio::test]
-async fn proxy_never_injects_identifying_headers() {
-    let (received, _) = proxy_roundtrip(
-        b"GET http://ORIGIN/ HTTP/1.1\r\nHost: ORIGIN\r\n\r\n",
-        RewritePolicy::FailClosed,
-    )
-    .await;
-
-    let lowered = String::from_utf8_lossy(&received).to_lowercase();
-    for banned in ["via:", "x-forwarded-for", "forwarded:", "x-real-ip"] {
-        assert!(!lowered.contains(banned), "{banned} present in {lowered:?}");
-    }
-}
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cargo test --test relay_tests`
-Expected: FAIL — `second_pipelined_request_is_also_rewritten` shows `GET http://127.0.0.1:PORT/two` at the origin, because after Task 8 the relay is still blind past the first head.
-
-- [ ] **Step 3: Extract a hooked copy loop**
-
-In `rust_proxy/src/lib.rs`, replace `bounded_copy_with_stats` (`lib.rs:508-574`) with the following. Behavior is unchanged; the loop body is now shared with the rewriting and observing paths so there is one place where idle timeout, byte caps, and stats accounting live.
-
-```rust
-/// What a copy hook decided to do with a chunk.
-pub enum Transformed {
-    /// Write the input bytes through unchanged.
-    Verbatim,
-    /// Write these bytes instead (possibly empty).
-    Replaced(Vec<u8>),
-}
-
-/// Shared copy loop: idle timeout, byte cap, stats flushing, FIN propagation.
-async fn copy_loop<R, W, F>(
-    mut reader: R,
-    mut writer: W,
-    max_size: u64,
-    idle_timeout: Duration,
-    direction: &str,
-    stats: Arc<ProxyStats>,
-    mut hook: F,
-) -> Result<(), ProxyError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-    F: FnMut(&[u8]) -> Result<Transformed, ProxyError>,
-{
-    let mut bytes_read = 0u64;
-    let mut last_flushed = 0u64;
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    loop {
-        let read_result = timeout(idle_timeout, reader.read(&mut buffer)).await;
-
-        match read_result {
-            Ok(Ok(0)) => {
-                writer.shutdown().await.ok();
-                break;
-            }
-            Ok(Ok(n)) => {
-                bytes_read += n as u64;
-                if (bytes_read - last_flushed) >= STATS_FLUSH_THRESHOLD {
-                    stats
-                        .bytes_transferred
-                        .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
-                    last_flushed = bytes_read;
-                }
-
-                if bytes_read > max_size {
-                    warn!("Download size limit exceeded: {} bytes", bytes_read);
-                    return Err("Download size limit exceeded".into());
-                }
-
-                let transformed = hook(&buffer[..n])?;
-                let payload: &[u8] = match &transformed {
-                    Transformed::Verbatim => &buffer[..n],
-                    Transformed::Replaced(bytes) => bytes,
-                };
-                if payload.is_empty() {
-                    continue;
-                }
-
-                let write_result = timeout(idle_timeout, writer.write_all(payload)).await;
-                match write_result {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        debug!("Write error in {}: {}", direction, e);
-                        return Err("Write error".into());
-                    }
-                    Err(_) => {
-                        warn!("Write timeout in {}", direction);
-                        return Err("Write timeout".into());
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                debug!("Read error in {}: {}", direction, e);
-                return Err(e.into());
-            }
-            Err(_) => {
-                warn!("Connection idle timeout in {}", direction);
-                return Err("Idle timeout".into());
-            }
-        }
-    }
-
-    if bytes_read > last_flushed {
-        stats
-            .bytes_transferred
-            .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
-    }
-
-    Ok(())
-}
-
-// Copy with size limits and statistics tracking.
-pub async fn bounded_copy_with_stats<R, W>(
-    reader: R,
-    writer: W,
-    max_size: u64,
-    idle_timeout: Duration,
-    direction: &str,
-    stats: Arc<ProxyStats>,
-) -> Result<(), ProxyError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    copy_loop(
-        reader,
-        writer,
-        max_size,
-        idle_timeout,
-        direction,
-        stats,
-        |_| Ok(Transformed::Verbatim),
-    )
-    .await
-}
-```
-
-- [ ] **Step 4: Add the shared rewriter state**
-
-In `rust_proxy/src/lib.rs`, insert immediately before `tunnel_fast` (`lib.rs:484`):
-
-```rust
-/// Rewriter state shared by the two halves of a plain-HTTP relay.
-///
-/// A `std::sync::Mutex` is correct here: it is only ever held for a synchronous
-/// state-machine step, never across an await. `upgrade_watch` lets the response
-/// half skip locking entirely, which keeps it a blind relay for all normal
-/// traffic — the lock is touched only while an upgrade offer is outstanding.
-struct RewriteShared {
-    stream: Mutex<crate::http_rewrite::RequestStream>,
-    upgrade_watch: AtomicBool,
-}
-```
-
-- [ ] **Step 5: Make `tunnel_fast` asymmetric**
-
-In `rust_proxy/src/lib.rs`, replace `tunnel_fast` (`lib.rs:484-506`) with:
-
-```rust
-async fn tunnel_fast(
-    mut src: TcpStream,
-    mut dst: TcpStream,
-    rewrite: Option<crate::http_rewrite::RequestStream>,
-    host: &str,
-    stats: Arc<ProxyStats>,
-) -> Result<(), ProxyError> {
-    src.set_nodelay(true)?;
-    dst.set_nodelay(true)?;
-    configure_client_socket(&src);
-
-    let (mut src_reader, mut src_writer) = src.split();
-    let (mut dst_reader, mut dst_writer) = dst.split();
-
-    match rewrite {
-        // CONNECT and SOCKS5: opaque both ways, zero parsing cost.
-        None => {
-            let client_to_server = bounded_copy_with_stats(
-                &mut src_reader,
-                &mut dst_writer,
-                MAX_DOWNLOAD_SIZE,
-                IDLE_TIMEOUT,
-                "client->server",
-                stats.clone(),
-            );
-            let server_to_client = bounded_copy_with_stats(
-                &mut dst_reader,
-                &mut src_writer,
-                MAX_DOWNLOAD_SIZE,
-                IDLE_TIMEOUT,
-                "server->client",
-                stats.clone(),
-            );
-            tokio::try_join!(client_to_server, server_to_client)?;
-        }
-        Some(stream) => {
-            let fallback = stream.is_fallback();
-            let shared = Arc::new(RewriteShared {
-                stream: Mutex::new(stream),
-                upgrade_watch: AtomicBool::new(false),
-            });
-
-            let out_shared = shared.clone();
-            let out_stats = stats.clone();
-            let out_host = host.to_string();
-            let client_to_server = copy_loop(
-                &mut src_reader,
-                &mut dst_writer,
-                MAX_DOWNLOAD_SIZE,
-                IDLE_TIMEOUT,
-                "client->server",
-                stats.clone(),
-                move |chunk| {
-                    let mut rewritten = Vec::with_capacity(chunk.len() + 64);
-                    let mut guard = out_shared
-                        .stream
-                        .lock()
-                        .map_err(|_| ProxyError::from("rewriter lock poisoned"))?;
-                    let result = guard.push(chunk, &mut rewritten);
-                    flush_rewrite_stats(&mut guard, &out_stats, &out_host, fallback);
-                    out_shared
-                        .upgrade_watch
-                        .store(guard.upgrade_offered(), Ordering::Relaxed);
-                    drop(guard);
-
-                    if let Err(anomaly) = result {
-                        // Mid-stream, so no status line can be injected; closing
-                        // is the only option that does not leak.
-                        warn!(
-                            "Rewrite anomaly '{}' for {} — closing connection",
-                            anomaly.name(),
-                            out_host
-                        );
-                        return Err(ProxyError::from("rewrite anomaly"));
-                    }
-                    Ok(Transformed::Replaced(rewritten))
-                },
-            );
-
-            let in_shared = shared.clone();
-            let server_to_client = copy_loop(
-                &mut dst_reader,
-                &mut src_writer,
-                MAX_DOWNLOAD_SIZE,
-                IDLE_TIMEOUT,
-                "server->client",
-                stats.clone(),
-                move |chunk| {
-                    // One atomic load in the common case; no lock, no copy.
-                    if in_shared.upgrade_watch.load(Ordering::Relaxed) {
-                        if let Ok(mut guard) = in_shared.stream.lock() {
-                            guard.observe_response(chunk);
-                            if !guard.upgrade_offered() {
-                                in_shared.upgrade_watch.store(false, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Ok(Transformed::Verbatim)
-                },
-            );
-
-            tokio::try_join!(client_to_server, server_to_client)?;
-        }
-    }
-
-    Ok(())
-}
-```
-
-- [ ] **Step 6: Expose the policy on `RequestStream`**
-
-In `rust_proxy/src/http_rewrite.rs`, add to `impl RequestStream`:
-
-```rust
-    pub fn is_fallback(&self) -> bool {
-        self.policy == RewritePolicy::Fallback
-    }
-```
-
-- [ ] **Step 7: Update the Task 8 call sites**
-
-In `rust_proxy/src/lib.rs`, in `connect_and_tunnel`, replace the two TODO calls:
-
-```rust
-                    tunnel_fast(client_socket, remote, stats).await
-```
-
-in the `Upstream::Tunnel` arm becomes:
-
-```rust
-                    tunnel_fast(client_socket, remote, None, host, stats).await
-```
-
-and in the `Upstream::Http` arm becomes:
-
-```rust
-                    tunnel_fast(client_socket, remote, Some(stream), host, stats).await
-```
-
-In `handle_socks5` (`rust_proxy/src/lib.rs`), find its `tunnel_fast(` call and add the two new arguments:
-
-```rust
-    tunnel_fast(client_socket, remote, None, host.as_str(), stats).await
-```
-
-- [ ] **Step 8: Run the tests**
+- [ ] **Step 9: Run the new tests**
 
 Run: `cargo test --test relay_tests`
 Expected: PASS, 4 passed.
 
-- [ ] **Step 9: Verify the full suite, especially SOCKS5 and the copy tests**
+- [ ] **Step 10: Verify the full suite**
 
 Run: `cargo test`
-Expected: all pass, including `tests/unit_tests.rs:209-300` (`bounded_copy_with_stats` signature preserved) and `tests/integration_tests.rs:117-307` (SOCKS5 end-to-end).
+Expected: all pass, including `tests/unit_tests.rs:209-300` (`bounded_copy_with_stats` signature preserved), `tests/integration_tests.rs:76-115` (CONNECT), and `tests/integration_tests.rs:117-307` (SOCKS5).
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add rust_proxy/src/lib.rs rust_proxy/src/http_rewrite.rs rust_proxy/tests/relay_tests.rs
-git commit -m "feat: asymmetric relay rewrites outbound HTTP, blind-relays inbound"
+git add rust_proxy/src/lib.rs rust_proxy/src/main.rs rust_proxy/tests/relay_tests.rs
+git commit -m "feat: rewrite every plain-HTTP request before forwarding upstream
+
+Replaces connect_and_tunnel's forward_headers flag with an Upstream enum,
+making the https-absolute-form bug unrepresentable, and raises the request
+head cap to 64KB."
 ```
 
 ---
@@ -3313,7 +3337,7 @@ After Task 12, these must all hold:
 | Fallback is opt-in | `rewrite_stats_tests.rs::fallback_is_off_by_default` |
 | Anomalies are visible per reason | `rewrite_stats_tests.rs::anomalies_are_counted_per_reason_not_as_one_total` |
 | Declined upgrades keep being rewritten | `http_rewrite_tests.rs::declined_upgrade_keeps_parsing_and_still_rewrites_later_requests` |
-| Origin socket keeps OS default timers | `configure_client_socket` takes one socket; Task 9 Step 4 |
+| Origin socket keeps OS default timers | `configure_client_socket` takes one socket; Task 8 Step 4 |
 | HTTPS/CONNECT path unchanged | `integration_tests.rs::test_connect_proxy_request` |
 | SOCKS5 path unchanged | `integration_tests.rs:117-307` |
 
