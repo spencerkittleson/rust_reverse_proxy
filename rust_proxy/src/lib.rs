@@ -1,5 +1,6 @@
-pub use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+pub use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub use std::sync::Arc;
+pub use std::sync::Mutex;
 pub use std::time::{Duration, Instant};
 pub use clap::Parser;
 pub use log::{debug, error, info, warn};
@@ -13,6 +14,8 @@ pub use url::Url;
 pub mod windows;
 
 pub mod http_rewrite;
+
+use crate::http_rewrite::RewriteAnomaly;
 
 pub type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -33,6 +36,17 @@ pub struct ProxyStats {
     pub https_requests: AtomicU64,
     pub socks_requests: AtomicU64,
     pub connection_errors: AtomicU64,
+    /// Requests successfully rewritten into direct-client form.
+    pub requests_sanitized: AtomicU64,
+    /// Per-reason anomaly counts, indexed by `RewriteAnomaly::index()`.
+    pub rewrite_anomalies: [AtomicU64; RewriteAnomaly::COUNT],
+    /// Last offending host per reason. Written only on anomaly, so this lock is
+    /// never contended on the hot path.
+    pub rewrite_anomaly_last_host: [Mutex<Option<String>>; RewriteAnomaly::COUNT],
+    /// Requests actually forwarded unrewritten, i.e. actual leaks.
+    pub rewrite_fallback_forwarded: AtomicU64,
+    /// Whether `--rewrite-fallback` is enabled, for the report banner.
+    pub rewrite_fallback_active: AtomicBool,
     pub start_time: Instant,
 }
 
@@ -52,8 +66,44 @@ impl ProxyStats {
             https_requests: AtomicU64::new(0),
             socks_requests: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
+            requests_sanitized: AtomicU64::new(0),
+            rewrite_anomalies: Default::default(),
+            rewrite_anomaly_last_host: Default::default(),
+            rewrite_fallback_forwarded: AtomicU64::new(0),
+            rewrite_fallback_active: AtomicBool::new(false),
             start_time: Instant::now(),
         }
+    }
+
+    pub fn record_sanitized(&self, n: u64) {
+        if n > 0 {
+            self.requests_sanitized.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one anomaly. `forwarded` is true only when the bytes actually went
+    /// upstream unrewritten, which is what the leak banner reports.
+    pub fn record_anomaly(&self, anomaly: RewriteAnomaly, host: &str, forwarded: bool) {
+        self.rewrite_anomalies[anomaly.index()].fetch_add(1, Ordering::Relaxed);
+        if forwarded {
+            self.rewrite_fallback_forwarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut slot) = self.rewrite_anomaly_last_host[anomaly.index()].lock() {
+            *slot = Some(host.to_string());
+        }
+    }
+
+    pub fn last_anomaly_host(&self, anomaly: RewriteAnomaly) -> Option<String> {
+        self.rewrite_anomaly_last_host[anomaly.index()]
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    pub fn set_fallback_active(&self, active: bool) {
+        self.rewrite_fallback_active
+            .store(active, Ordering::Relaxed);
     }
 
     pub fn log_stats(&self) {
@@ -75,6 +125,33 @@ impl ProxyStats {
         info!("   HTTPS Requests: {}", https);
         info!("   SOCKS5 Requests: {}", socks);
         info!("   Connection Errors: {}", errors);
+
+        let sanitized = self.requests_sanitized.load(Ordering::Relaxed);
+        let total_anomalies: u64 = RewriteAnomaly::ALL
+            .iter()
+            .map(|a| self.rewrite_anomalies[a.index()].load(Ordering::Relaxed))
+            .sum();
+        info!("   Rewrite: {} sanitized, {} anomalies", sanitized, total_anomalies);
+
+        if self.rewrite_fallback_active.load(Ordering::Relaxed) {
+            let leaked = self.rewrite_fallback_forwarded.load(Ordering::Relaxed);
+            warn!(
+                "      ⚠ --rewrite-fallback ACTIVE — {} requests forwarded unrewritten (proxy visible to origin)",
+                leaked
+            );
+        }
+
+        // Only non-zero reasons print, so a clean run stays one line.
+        for anomaly in RewriteAnomaly::ALL {
+            let count = self.rewrite_anomalies[anomaly.index()].load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            match self.last_anomaly_host(anomaly) {
+                Some(host) => info!("      {}: {} (last: {})", anomaly.name(), count, host),
+                None => info!("      {}: {}", anomaly.name(), count),
+            }
+        }
     }
 }
 
