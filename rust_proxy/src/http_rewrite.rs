@@ -170,6 +170,57 @@ pub fn replace_header_value(line: &[u8], new_value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Trim leading and trailing spaces and horizontal tabs.
+fn trim(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    &s[start..end]
+}
+
+/// Lowercased, comma-separated `Connection` tokens with empties removed.
+pub fn connection_tokens(value: &[u8]) -> Vec<Vec<u8>> {
+    value
+        .split(|&b| b == b',')
+        .map(|t| trim(t).to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn is_forwardable_token(token: &[u8]) -> bool {
+    FORWARDABLE_CONNECTION_TOKENS
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(token))
+}
+
+/// The value part of a header line (after the colon and optional whitespace).
+fn header_value(line: &[u8]) -> &[u8] {
+    match line.iter().position(|&b| b == b':') {
+        Some(colon) => trim(&line[colon + 1..]),
+        None => b"",
+    }
+}
+
+/// Reduce a `Connection` value to its forwardable tokens, preserving each
+/// surviving token's original bytes and their order. `None` means drop the line.
+fn reduce_connection_value(value: &[u8]) -> Option<Vec<u8>> {
+    let kept: Vec<&[u8]> = value
+        .split(|&b| b == b',')
+        .map(trim)
+        .filter(|t| !t.is_empty() && is_forwardable_token(t))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.join(&b", "[..]))
+}
+
 /// Rule 1: absolute-form request-target becomes origin-form.
 ///
 /// Returns the rewritten line and the `Host` value implied by the target, which
@@ -208,17 +259,50 @@ fn rewrite_request_line(line: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RewriteAnomal
 }
 
 /// Rewrite one complete request head into the form a direct client would send.
+///
+/// The five rules are applied in order; rule 5 operates on the `Connection`
+/// header as rule 3 leaves it. Every byte not named by a rule is copied verbatim.
 pub fn sanitize_request_head(head: &[u8]) -> Result<Vec<u8>, RewriteAnomaly> {
     let (request_line, header_lines) = split_head(head).ok_or(RewriteAnomaly::Unparseable)?;
     let (new_request_line, authority) = rewrite_request_line(request_line)?;
 
+    // Pass 1: decide what rules 3-5 will do before emitting anything.
+    let has_connection = header_lines.iter().any(|l| name_is(l, b"Connection"));
+    let has_host = header_lines.iter().any(|l| name_is(l, b"Host"));
+
+    // Rule 3: an absent Connection means Proxy-Connection becomes the Connection
+    // header, so rule 5's token list comes from whichever one will survive.
+    let effective_connection: Vec<Vec<u8>> = header_lines
+        .iter()
+        .find(|l| {
+            name_is(l, b"Connection") || (!has_connection && name_is(l, b"Proxy-Connection"))
+        })
+        .map(|l| connection_tokens(header_value(l)))
+        .unwrap_or_default();
+
+    let named_hop_by_hop: Vec<&Vec<u8>> = effective_connection
+        .iter()
+        .filter(|t| !is_forwardable_token(t))
+        .collect();
+
+    // A rewritten header cannot be safely edited if a fold continues its value.
+    let rewritten = |line: &[u8]| {
+        name_is(line, b"Host")
+            || name_is(line, b"Connection")
+            || name_is(line, b"Proxy-Connection")
+            || name_is(line, b"Proxy-Authorization")
+    };
+    for pair in header_lines.windows(2) {
+        if rewritten(pair[0]) && is_obs_fold(pair[1]) {
+            return Err(RewriteAnomaly::ObsFoldInRewrittenHeader);
+        }
+    }
+
+    // Pass 2: emit.
     let mut out = Vec::with_capacity(head.len() + 32);
     out.extend_from_slice(&new_request_line);
     out.extend_from_slice(CRLF);
 
-    // Rule 2: insert Host first when the client omitted it. First is where
-    // browsers and curl put it.
-    let has_host = header_lines.iter().any(|l| name_is(l, b"Host"));
     if !has_host && !authority.is_empty() {
         out.extend_from_slice(b"Host: ");
         out.extend_from_slice(&authority);
@@ -226,11 +310,48 @@ pub fn sanitize_request_head(head: &[u8]) -> Result<Vec<u8>, RewriteAnomaly> {
     }
 
     for line in &header_lines {
+        // Rule 4.
+        if name_is(line, b"Proxy-Authorization") {
+            continue;
+        }
+        // Rule 5: drop headers named by a non-forwardable Connection token.
+        if named_hop_by_hop
+            .iter()
+            .any(|t| name_is(line, t.as_slice()))
+        {
+            continue;
+        }
+        // Rule 3.
+        if name_is(line, b"Proxy-Connection") {
+            if has_connection {
+                continue;
+            }
+            match reduce_connection_value(header_value(line)) {
+                Some(v) => {
+                    out.extend_from_slice(b"Connection: ");
+                    out.extend_from_slice(&v);
+                }
+                None => continue,
+            }
+            out.extend_from_slice(CRLF);
+            continue;
+        }
+        // Rule 5, second half: reduce the Connection line itself.
+        if name_is(line, b"Connection") {
+            match reduce_connection_value(header_value(line)) {
+                Some(v) => out.extend_from_slice(&replace_header_value(line, &v)),
+                None => continue,
+            }
+            out.extend_from_slice(CRLF);
+            continue;
+        }
+        // Rule 2.
         if name_is(line, b"Host") && !authority.is_empty() {
             out.extend_from_slice(&replace_header_value(line, &authority));
-        } else {
-            out.extend_from_slice(line);
+            out.extend_from_slice(CRLF);
+            continue;
         }
+        out.extend_from_slice(line);
         out.extend_from_slice(CRLF);
     }
 

@@ -188,3 +188,96 @@ fn non_utf8_header_value_survives_byte_for_byte() {
     let expected: &[u8] = b"GET / HTTP/1.1\r\nHost: e.example\r\nX-Note: caf\xe9\r\n\r\n";
     assert_sanitized(input, expected);
 }
+
+#[test]
+fn proxy_connection_is_renamed_in_place_not_deleted() {
+    // Deleting it would strip the client's stated intent and leave a header set
+    // no real client emits. The line keeps its position.
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+    );
+}
+
+#[test]
+fn proxy_connection_is_dropped_when_connection_already_present() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: close\r\nProxy-Connection: keep-alive\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nConnection: close\r\n\r\n",
+    );
+}
+
+#[test]
+fn proxy_authorization_is_always_dropped() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nProxy-Authorization: Basic zzz\r\nAccept: */*\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nAccept: */*\r\n\r\n",
+    );
+}
+
+#[test]
+fn headers_named_by_connection_tokens_are_dropped() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive, X-Hop\r\nX-Hop: secret\r\nAccept: */*\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+    );
+}
+
+#[test]
+fn connection_line_is_dropped_when_no_forwardable_token_survives() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: X-Hop\r\nX-Hop: secret\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\n\r\n",
+    );
+}
+
+#[test]
+fn upgrade_token_and_upgrade_header_both_survive() {
+    // RFC 7230 calls `upgrade` hop-by-hop, but dropping it would make upgrade
+    // passthrough unreachable.
+    assert_sanitized(
+        b"GET http://e.example/ws HTTP/1.1\r\nHost: e.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        b"GET /ws HTTP/1.1\r\nHost: e.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+    );
+}
+
+#[test]
+fn renamed_proxy_connection_still_drives_hop_by_hop_removal() {
+    // Rule 5 operates on the Connection header as rule 3 leaves it.
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nProxy-Connection: keep-alive, X-Hop\r\nX-Hop: secret\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive\r\n\r\n",
+    );
+}
+
+#[test]
+fn connection_token_matching_is_case_insensitive() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: KEEP-ALIVE, x-hop\r\nX-HoP: secret\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nConnection: KEEP-ALIVE\r\n\r\n",
+    );
+}
+
+#[test]
+fn obs_fold_in_untouched_header_passes_through() {
+    assert_sanitized(
+        b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nX-Long: a\r\n\tb\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: e.example\r\nX-Long: a\r\n\tb\r\n\r\n",
+    );
+}
+
+#[test]
+fn obs_fold_in_rewritten_header_is_an_anomaly() {
+    assert_eq!(
+        sanitize_request_head(
+            b"GET http://e.example/ HTTP/1.1\r\nHost: stale\r\n\texample\r\n\r\n"
+        ),
+        Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
+    );
+    assert_eq!(
+        sanitize_request_head(
+            b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive\r\n\tfoo\r\n\r\n"
+        ),
+        Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
+    );
+}
