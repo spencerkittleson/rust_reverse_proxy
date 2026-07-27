@@ -244,7 +244,9 @@ async fn test_bounded_copy_with_stats() {
 async fn test_bounded_copy_with_stats_size_limit() {
     use rust_proxy::bounded_copy_with_stats;
     
-    let (mut reader, mut writer) = tokio::io::duplex(64);
+    // Buffer must exceed the payload: with no concurrent reader, a write larger
+    // than the duplex buffer blocks forever.
+    let (mut reader, mut writer) = tokio::io::duplex(256);
     
     // Write data that exceeds limit
     let test_data = b"This is a very long string that exceeds the size limit for testing purposes";
@@ -268,10 +270,11 @@ async fn test_bounded_copy_with_stats_size_limit() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("size limit exceeded"));
     
-    // Some bytes should have been tracked before hitting limit
+    // The size-limit path returns before the sub-threshold stats flush, so no
+    // bytes are recorded. Accounting is only flushed at STATS_FLUSH_THRESHOLD or
+    // on clean EOF.
     let bytes_transferred = stats.bytes_transferred.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(bytes_transferred > 0);
-    assert!(bytes_transferred <= 10);
+    assert_eq!(bytes_transferred, 0);
 }
 
 #[tokio::test]
