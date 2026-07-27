@@ -515,32 +515,41 @@ const TCP_QUICKACK: i32 = 12;
 #[cfg(unix)]
 const TCP_USER_TIMEOUT: i32 = 18;
 
+/// Tune the **client-facing** socket only.
+///
+/// The origin-facing socket deliberately inherits OS defaults: these values are
+/// far from default and are observable from the origin side. Accepted cost is
+/// slower dead-origin detection — establishment is still bounded by
+/// `CONNECT_TIMEOUT` and stalls by `IDLE_TIMEOUT`. Waiting minutes on a stalled
+/// peer is what a normal client does, so the fingerprint fix and the correct
+/// behavior coincide.
 #[cfg(unix)]
-fn configure_keepalive(src: &TcpStream, dst: &TcpStream) {
+fn configure_client_socket(client: &TcpStream) {
     use std::os::unix::io::AsRawFd;
 
     fn set_sock(fd: i32, level: i32, opt: i32, val: i32) {
         let _ = unsafe {
-            libc::setsockopt(fd, level, opt,
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
                 &val as *const _ as *const _,
                 std::mem::size_of::<i32>() as libc::socklen_t,
             )
         };
     }
 
+    let fd = client.as_raw_fd();
     let one = 1i32;
-    set_sock(src.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
-    set_sock(dst.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
-    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
-    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
-    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, TCP_QUICKACK, one);
-    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, TCP_QUICKACK, one);
-    set_sock(src.as_raw_fd(), libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
-    set_sock(dst.as_raw_fd(), libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
+    set_sock(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, one);
+    set_sock(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+    set_sock(fd, libc::IPPROTO_TCP, TCP_QUICKACK, one);
+    set_sock(fd, libc::IPPROTO_TCP, TCP_USER_TIMEOUT, 10_000);
 }
 
+/// Tune the **client-facing** socket only. See the Unix variant for rationale.
 #[cfg(windows)]
-fn configure_keepalive(src: &TcpStream, dst: &TcpStream) {
+fn configure_client_socket(client: &TcpStream) {
     use std::os::windows::io::AsRawSocket;
 
     #[repr(C)]
@@ -562,23 +571,27 @@ fn configure_keepalive(src: &TcpStream, dst: &TcpStream) {
         let _ = unsafe {
             let mut ret = 0;
             winapi::um::winsock2::WSAIoctl(
-                socket, SIO_KEEPALIVE_VALS,
+                socket,
+                SIO_KEEPALIVE_VALS,
                 ka as *const _ as *mut _,
                 std::mem::size_of::<TcpKeepalive>() as _,
-                std::ptr::null_mut(), 0,
-                &mut ret, std::ptr::null_mut(), None,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+                None,
             )
         };
     }
 
-    set_keepalive(src.as_raw_socket() as _, &ka);
-    set_keepalive(dst.as_raw_socket() as _, &ka);
+    set_keepalive(client.as_raw_socket() as _, &ka);
 }
 
 async fn tunnel_fast(mut src: TcpStream, mut dst: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
     src.set_nodelay(true)?;
     dst.set_nodelay(true)?;
-    configure_keepalive(&src, &dst);
+    // `src` is the client; `dst` is the origin and keeps OS defaults.
+    configure_client_socket(&src);
 
     let (mut src_reader, mut src_writer) = src.split();
     let (mut dst_reader, mut dst_writer) = dst.split();
