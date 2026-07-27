@@ -293,3 +293,212 @@ fn obs_fold_on_a_dropped_hop_by_hop_header_fails_closed() {
         Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
     );
 }
+
+use rust_proxy::http_rewrite::{RequestStream, RewritePolicy};
+
+/// Feed `input` through a stream in `chunk`-sized pieces. Small chunk sizes
+/// exercise the split-read paths that blind relays never hit.
+fn drive(
+    policy: RewritePolicy,
+    input: &[u8],
+    chunk: usize,
+) -> Result<Vec<u8>, RewriteAnomaly> {
+    let mut stream = RequestStream::new(policy, 65536);
+    let mut out = Vec::new();
+    for piece in input.chunks(chunk) {
+        stream.push(piece, &mut out)?;
+    }
+    Ok(out)
+}
+
+#[test]
+fn every_request_on_a_reused_connection_is_rewritten() {
+    // The regression this architecture exists to prevent: requests 2 and 3 must
+    // not reach the origin in absolute form.
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                  GET http://e.example/two HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                  GET http://e.example/three HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let expected = b"GET /one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                     GET /two HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                     GET /three HTTP/1.1\r\nHost: e.example\r\n\r\n";
+
+    for chunk in [1usize, 7, 64, 4096] {
+        let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(expected)
+        );
+        assert!(
+            !got.windows(7).any(|w| w == b"http://"),
+            "absolute form leaked at chunk size {chunk}"
+        );
+    }
+}
+
+#[test]
+fn mid_stream_origin_form_request_is_supported_not_an_anomaly() {
+    // Forwarding origin form leaks nothing, because it is exactly what rule 1
+    // produces. Rules 2-5 still apply, so the proxy header is still stripped.
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                  GET /two HTTP/1.1\r\nHost: e.example\r\nProxy-Connection: close\r\n\r\n";
+    let expected = b"GET /one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                     GET /two HTTP/1.1\r\nHost: e.example\r\nConnection: close\r\n\r\n";
+    let got = drive(RewritePolicy::FailClosed, input, 1).unwrap();
+    assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(expected)
+    );
+}
+
+#[test]
+fn content_length_body_is_relayed_verbatim() {
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nContent-Length: 5\r\n\r\nab=cd\
+                  GET http://e.example/y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let expected = b"POST /x HTTP/1.1\r\nHost: e.example\r\nContent-Length: 5\r\n\r\nab=cd\
+                     GET /y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    for chunk in [1usize, 3, 4096] {
+        let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+#[test]
+fn chunked_body_is_relayed_verbatim_and_next_request_is_rewritten() {
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  5\r\nhello\r\n0\r\n\r\n\
+                  GET http://e.example/y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let expected = b"POST /x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     5\r\nhello\r\n0\r\n\r\n\
+                     GET /y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    for chunk in [1usize, 5, 4096] {
+        let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+#[test]
+fn chunked_trailers_are_relayed_and_end_the_body() {
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  0\r\nX-Trailer: v\r\n\r\n\
+                  GET http://e.example/y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let expected = b"POST /x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     0\r\nX-Trailer: v\r\n\r\n\
+                     GET /y HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let got = drive(RewritePolicy::FailClosed, input, 1).unwrap();
+    assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(expected)
+    );
+}
+
+#[test]
+fn transfer_encoding_plus_content_length_always_fails_closed() {
+    // The most important assertion in this file. Forwarding this verbatim would
+    // make the proxy a request-smuggling gadget aimed at the origin, so the
+    // fallback flag must not reach it.
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\n\
+                  Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n";
+    for policy in [RewritePolicy::FailClosed, RewritePolicy::Fallback] {
+        assert_eq!(
+            drive(policy, input, 4096),
+            Err(RewriteAnomaly::FramingConflict),
+            "framing conflict must fail closed under {policy:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_conflicting_content_length_is_a_framing_conflict() {
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\n\
+                  Content-Length: 5\r\nContent-Length: 6\r\n\r\n";
+    assert_eq!(
+        drive(RewritePolicy::FailClosed, input, 4096),
+        Err(RewriteAnomaly::FramingConflict)
+    );
+}
+
+#[test]
+fn duplicate_agreeing_content_length_is_accepted() {
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\n\
+                  Content-Length: 2\r\nContent-Length: 2\r\n\r\nhi";
+    assert!(drive(RewritePolicy::FailClosed, input, 4096).is_ok());
+}
+
+#[test]
+fn oversized_head_fails_closed_by_default() {
+    let mut input = b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\n".to_vec();
+    input.extend_from_slice(b"X-Pad: ");
+    input.extend(std::iter::repeat_n(b'a', 70_000));
+    input.extend_from_slice(b"\r\n\r\n");
+
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    let mut result = Ok(());
+    for piece in input.chunks(4096) {
+        result = stream.push(piece, &mut out);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+}
+
+#[test]
+fn fallback_forwards_verbatim_and_switches_to_passthrough() {
+    // Unparseable is fallback-eligible. With the flag on, the bytes go through
+    // untouched — that is the leak the flag buys — and parsing stops, because
+    // the failed parse is the same parse that would find the next boundary.
+    let input = b"!!! not http !!!\r\n\r\nany trailing bytes at all";
+    let mut stream = RequestStream::new(RewritePolicy::Fallback, 65536);
+    let mut out = Vec::new();
+    stream.push(input, &mut out).expect("fallback should not error");
+
+    assert_eq!(out, input.to_vec());
+    assert!(stream.is_passthrough());
+    assert_eq!(stream.take_anomalies(), vec![RewriteAnomaly::Unparseable]);
+    // Draining is destructive so the caller cannot double-count.
+    assert!(stream.take_anomalies().is_empty());
+}
+
+#[test]
+fn unparseable_fails_closed_by_default() {
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    assert_eq!(
+        stream.push(b"!!! not http !!!\r\n\r\n", &mut out),
+        Err(RewriteAnomaly::Unparseable)
+    );
+    assert_eq!(stream.take_anomalies(), vec![RewriteAnomaly::Unparseable]);
+}
+
+#[test]
+fn sanitized_request_count_tracks_successful_rewrites() {
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                  GET http://e.example/two HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut out = Vec::new();
+    stream.push(input, &mut out).unwrap();
+    assert_eq!(stream.requests_sanitized(), 2);
+    assert!(stream.take_anomalies().is_empty());
+}

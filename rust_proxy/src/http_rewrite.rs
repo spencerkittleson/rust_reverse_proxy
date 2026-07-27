@@ -361,3 +361,285 @@ pub fn sanitize_request_head(head: &[u8]) -> Result<Vec<u8>, RewriteAnomaly> {
     out.extend_from_slice(CRLF);
     Ok(out)
 }
+
+/// How the body of a request is delimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// No body; the next request head follows immediately.
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// Determine body framing, rejecting the ambiguous combinations that are also
+/// request-smuggling vectors.
+fn framing_of(head: &[u8]) -> Result<Framing, RewriteAnomaly> {
+    let (_, header_lines) = split_head(head).ok_or(RewriteAnomaly::Unparseable)?;
+
+    let mut te_present = false;
+    let mut chunked = false;
+    let mut lengths: Vec<u64> = Vec::new();
+
+    for line in &header_lines {
+        if name_is(line, b"Transfer-Encoding") {
+            te_present = true;
+            let value = header_value(line);
+            let last = value.split(|&b| b == b',').map(trim).next_back().unwrap_or(b"");
+            if last.eq_ignore_ascii_case(b"chunked") {
+                chunked = true;
+            }
+        } else if name_is(line, b"Content-Length") {
+            let text = std::str::from_utf8(header_value(line))
+                .map_err(|_| RewriteAnomaly::FramingConflict)?;
+            let n: u64 = text
+                .trim()
+                .parse()
+                .map_err(|_| RewriteAnomaly::FramingConflict)?;
+            lengths.push(n);
+        }
+    }
+
+    if let Some(&first) = lengths.first() {
+        if lengths.iter().any(|&n| n != first) {
+            return Err(RewriteAnomaly::FramingConflict);
+        }
+    }
+    // Both present: RFC 7230 says ignore Content-Length, but implementations
+    // disagree, and that disagreement is the smuggling primitive. Refuse.
+    if te_present && !lengths.is_empty() {
+        return Err(RewriteAnomaly::FramingConflict);
+    }
+    // A Transfer-Encoding we cannot frame leaves us unable to find the next
+    // request boundary.
+    if te_present && !chunked {
+        return Err(RewriteAnomaly::FramingConflict);
+    }
+    if chunked {
+        return Ok(Framing::Chunked);
+    }
+    match lengths.first() {
+        Some(&n) if n > 0 => Ok(Framing::Length(n)),
+        _ => Ok(Framing::None),
+    }
+}
+
+/// What to do when a request cannot be rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewritePolicy {
+    /// Close the connection. Forwarding unrewritten bytes *is* the leak.
+    FailClosed,
+    /// Forward verbatim and record it. Leaks proxy presence for that request.
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkPhase {
+    Size,
+    Data { remaining: u64 },
+    DataCrlf,
+    Trailers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    ReadingHead,
+    Body { remaining: u64 },
+    Chunked(ChunkPhase),
+    /// No longer HTTP/1.1 messages: relay bytes untouched forever.
+    Passthrough,
+}
+
+/// Rewrites every request in a client→origin byte stream.
+///
+/// Responses are never rewritten, so only this direction needs parsing.
+pub struct RequestStream {
+    state: State,
+    pending: Vec<u8>,
+    max_head: usize,
+    policy: RewritePolicy,
+    anomalies: Vec<RewriteAnomaly>,
+    requests_sanitized: u64,
+}
+
+impl RequestStream {
+    pub fn new(policy: RewritePolicy, max_head: usize) -> Self {
+        Self {
+            state: State::ReadingHead,
+            pending: Vec::new(),
+            max_head,
+            policy,
+            anomalies: Vec::new(),
+            requests_sanitized: 0,
+        }
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self.state, State::Passthrough)
+    }
+
+    pub fn requests_sanitized(&self) -> u64 {
+        self.requests_sanitized
+    }
+
+    /// Drain recorded anomalies. Destructive, so a caller polling repeatedly
+    /// cannot double-count.
+    pub fn take_anomalies(&mut self) -> Vec<RewriteAnomaly> {
+        std::mem::take(&mut self.anomalies)
+    }
+
+    /// Feed client bytes in, get origin bytes out.
+    pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), RewriteAnomaly> {
+        if matches!(self.state, State::Passthrough) {
+            out.extend_from_slice(input);
+            return Ok(());
+        }
+        self.pending.extend_from_slice(input);
+
+        loop {
+            match self.state {
+                State::Passthrough => {
+                    out.append(&mut self.pending);
+                    return Ok(());
+                }
+                State::ReadingHead => {
+                    let terminator = find(&self.pending, HEAD_TERMINATOR);
+                    let Some(p) = terminator else {
+                        if self.pending.len() > self.max_head {
+                            let all: Vec<u8> = self.pending.drain(..).collect();
+                            return self.on_anomaly(RewriteAnomaly::HeadTooLarge, &all, out);
+                        }
+                        return Ok(());
+                    };
+                    let head_len = p + HEAD_TERMINATOR.len();
+                    if head_len > self.max_head {
+                        let all: Vec<u8> = self.pending.drain(..).collect();
+                        return self.on_anomaly(RewriteAnomaly::HeadTooLarge, &all, out);
+                    }
+                    let head: Vec<u8> = self.pending.drain(..head_len).collect();
+                    self.handle_head(&head, out)?;
+                }
+                State::Body { remaining } => {
+                    let take = std::cmp::min(remaining, self.pending.len() as u64) as usize;
+                    out.extend(self.pending.drain(..take));
+                    let left = remaining - take as u64;
+                    self.state = if left == 0 {
+                        State::ReadingHead
+                    } else {
+                        State::Body { remaining: left }
+                    };
+                }
+                State::Chunked(_) => {
+                    if !self.step_chunked(out)? {
+                        return Ok(());
+                    }
+                }
+            }
+
+            if self.pending.is_empty() && !matches!(self.state, State::Passthrough) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Rewrite one head and set up body framing.
+    fn handle_head(&mut self, head: &[u8], out: &mut Vec<u8>) -> Result<(), RewriteAnomaly> {
+        let framing = match framing_of(head) {
+            Ok(f) => f,
+            Err(a) => return self.on_anomaly(a, head, out),
+        };
+        let sanitized = match sanitize_request_head(head) {
+            Ok(s) => s,
+            Err(a) => return self.on_anomaly(a, head, out),
+        };
+
+        out.extend_from_slice(&sanitized);
+        self.requests_sanitized += 1;
+        self.state = match framing {
+            Framing::None => State::ReadingHead,
+            Framing::Length(n) => State::Body { remaining: n },
+            Framing::Chunked => State::Chunked(ChunkPhase::Size),
+        };
+        Ok(())
+    }
+
+    /// Advance one chunked-body step. `Ok(false)` means "need more bytes".
+    fn step_chunked(&mut self, out: &mut Vec<u8>) -> Result<bool, RewriteAnomaly> {
+        let phase = match self.state {
+            State::Chunked(p) => p,
+            _ => return Ok(false),
+        };
+
+        match phase {
+            ChunkPhase::Size => match httparse::parse_chunk_size(&self.pending) {
+                Ok(httparse::Status::Complete((consumed, size))) => {
+                    out.extend(self.pending.drain(..consumed));
+                    self.state = if size == 0 {
+                        State::Chunked(ChunkPhase::Trailers)
+                    } else {
+                        State::Chunked(ChunkPhase::Data { remaining: size })
+                    };
+                    Ok(true)
+                }
+                Ok(httparse::Status::Partial) => Ok(false),
+                Err(_) => {
+                    let all: Vec<u8> = self.pending.drain(..).collect();
+                    self.on_anomaly(RewriteAnomaly::Unparseable, &all, out)?;
+                    Ok(true)
+                }
+            },
+            ChunkPhase::Data { remaining } => {
+                let take = std::cmp::min(remaining, self.pending.len() as u64) as usize;
+                out.extend(self.pending.drain(..take));
+                let left = remaining - take as u64;
+                self.state = if left == 0 {
+                    State::Chunked(ChunkPhase::DataCrlf)
+                } else {
+                    State::Chunked(ChunkPhase::Data { remaining: left })
+                };
+                Ok(true)
+            }
+            ChunkPhase::DataCrlf => {
+                if self.pending.len() < 2 {
+                    return Ok(false);
+                }
+                out.extend(self.pending.drain(..2));
+                self.state = State::Chunked(ChunkPhase::Size);
+                Ok(true)
+            }
+            ChunkPhase::Trailers => {
+                let Some(p) = find(&self.pending, CRLF) else {
+                    return Ok(false);
+                };
+                out.extend(self.pending.drain(..p + 2));
+                if p == 0 {
+                    // Empty line: trailer section over.
+                    self.state = State::ReadingHead;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Record an anomaly, then either forward verbatim or fail closed.
+    ///
+    /// On fallback the connection also becomes `Passthrough`: the parse that just
+    /// failed is the same parse that would locate the next request boundary, so
+    /// continuing would be guesswork. One leak per connection, not a
+    /// desynchronized stream.
+    fn on_anomaly(
+        &mut self,
+        anomaly: RewriteAnomaly,
+        verbatim: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), RewriteAnomaly> {
+        self.anomalies.push(anomaly);
+
+        if self.policy == RewritePolicy::Fallback && anomaly.fallback_eligible() {
+            out.extend_from_slice(verbatim);
+            out.append(&mut self.pending);
+            self.state = State::Passthrough;
+            return Ok(());
+        }
+        Err(anomaly)
+    }
+}
