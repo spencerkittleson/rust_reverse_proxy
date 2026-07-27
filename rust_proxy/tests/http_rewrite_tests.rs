@@ -1,13 +1,19 @@
 use rust_proxy::http_rewrite::{sanitize_request_head, RewriteAnomaly};
 
-/// Assert byte-exact output. Renders as text on failure, which matters because
-/// the whole point of this module is exact bytes.
+/// Assert byte-exact output.
+///
+/// Compares the raw slices — NOT lossy strings, which would collapse any
+/// non-UTF-8 divergence to U+FFFD on both sides and compare equal. Byte identity
+/// is this module's entire contract, so the guard for it must be byte-exact.
+/// Lossy rendering appears only in the failure message, for readability.
 fn assert_sanitized(input: &[u8], expected: &[u8]) {
     let got = sanitize_request_head(input).expect("should sanitize");
     assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
         String::from_utf8_lossy(&got),
-        String::from_utf8_lossy(expected),
-        "byte mismatch"
+        String::from_utf8_lossy(expected)
     );
 }
 
