@@ -281,3 +281,15 @@ fn obs_fold_in_rewritten_header_is_an_anomaly() {
         Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
     );
 }
+
+#[test]
+fn obs_fold_on_a_dropped_hop_by_hop_header_fails_closed() {
+    // X-Hop is named by a Connection token, so rule 5 drops it. A fold
+    // continuing X-Hop must not be orphaned onto the wire — fail closed.
+    assert_eq!(
+        sanitize_request_head(
+            b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive, X-Hop\r\nX-Hop: a\r\n\tb\r\n\r\n"
+        ),
+        Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
+    );
+}

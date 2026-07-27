@@ -285,15 +285,18 @@ pub fn sanitize_request_head(head: &[u8]) -> Result<Vec<u8>, RewriteAnomaly> {
         .filter(|t| !is_forwardable_token(t))
         .collect();
 
-    // A rewritten header cannot be safely edited if a fold continues its value.
-    let rewritten = |line: &[u8]| {
+    // A header whose value pass 2 rewrites OR drops cannot carry an obs-fold
+    // continuation safely: rewriting can't see past the first line, and dropping
+    // the header would orphan the fold onto its own line. Both fail closed.
+    let touched = |line: &[u8]| {
         name_is(line, b"Host")
             || name_is(line, b"Connection")
             || name_is(line, b"Proxy-Connection")
             || name_is(line, b"Proxy-Authorization")
+            || named_hop_by_hop.iter().any(|t| name_is(line, t.as_slice()))
     };
     for pair in header_lines.windows(2) {
-        if rewritten(pair[0]) && is_obs_fold(pair[1]) {
+        if touched(pair[0]) && is_obs_fold(pair[1]) {
             return Err(RewriteAnomaly::ObsFoldInRewrittenHeader);
         }
     }
