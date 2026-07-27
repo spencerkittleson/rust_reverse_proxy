@@ -10,11 +10,82 @@ A high-performance, configurable HTTP/HTTPS/SOCKS5 proxy server written in Rust 
 - **Cross-Platform Binaries**: Pre-built releases for Windows x64, Linux x64, macOS x64/arm64
 - **Configurable Network Settings**: Customizable host and port with connection limiting
 - **Comprehensive Logging**: Configurable log levels (debug, info, warn, error) with detailed diagnostics
-- **Tunnel-Friendly Performance**: 64KB buffers, 10,000 concurrent connections, 1-hour idle timeout, 64GB per-direction transfer cap
+- **Tunnel-Friendly Performance**: 16KB buffers, 1,000 concurrent connections, 5-minute idle timeout, 64GB per-direction transfer cap
+- **Transparent to Origins**: Rewrites proxied requests into origin-form so servers cannot tell a proxy is in the path (see [Proxy visibility](#proxy-visibility))
 - **FIN Propagation**: Writer shutdown on tunnel EOF ensures graceful connection termination
 - **Robust Error Handling**: Intelligent SSL error analysis with actionable recommendations
 - **Async Architecture**: Built on tokio for high-performance concurrent connections
 - **Automated Releases**: GitHub Actions workflow for automated cross-platform builds and releases
+
+## Proxy visibility
+
+This proxy does not announce itself to origin servers. Requests are rewritten
+into the exact form a directly-connected client would send:
+
+- Absolute-form request lines become origin-form, so the origin sees
+  `GET /path HTTP/1.1` rather than `GET http://host/path HTTP/1.1`.
+- `Host` is corrected from the request-target authority.
+- `Proxy-Connection` is renamed to `Connection`, preserving the client's stated
+  intent rather than dropping it.
+- `Proxy-Authorization` and headers named by `Connection` tokens are removed
+  per RFC 7230 §6.1.
+- Every request on a reused keep-alive connection is rewritten, not just the
+  first.
+- No `Via`, `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `Proxy-Agent`,
+  `Server`, or `Date` header is ever added.
+- Non-default TCP keepalive and user-timeout values apply to the client-facing
+  socket only; the origin-facing socket inherits OS defaults.
+
+Nothing else is normalized. Header order, field-name casing, and whitespace are
+preserved byte-for-byte, because tidying them would replace one fingerprint
+with another.
+
+### What this does not hide
+
+- **Your IP address.** Traffic egresses from the same network with or without
+  the proxy.
+- **Your TLS fingerprint.** HTTPS travels through a CONNECT tunnel and is never
+  terminated, so the origin sees your client's own ClientHello and JA3/JA4.
+  Nothing to hide and nothing to fix.
+- **Your TCP/IP stack.** The origin observes the proxy host's TTL, MSS, and
+  window scaling, which may not match the OS your `User-Agent` claims. Matching
+  them is an explicit non-goal: it needs per-OS kernel tuning, breaks on
+  updates, and defeats only p0f-class analysis. A mismatch reads as "someone
+  behind a NAT," which describes billions of connections.
+- **Anything from your own client.** Error responses the proxy returns are seen
+  only by the local client, which already knows the proxy exists.
+
+### `--rewrite-fallback`
+
+Off by default. When a request cannot be rewritten, the proxy closes the
+connection rather than forward unrewritten bytes, because forwarding them is
+exactly the leak this feature removes.
+
+Enabling `--rewrite-fallback` forwards those requests verbatim instead, which
+reveals proxy presence to the origin for each one. Use it to diagnose a client
+the rewriter mishandles, then turn it back off. While it is enabled the
+statistics report carries a banner showing how many requests leaked.
+
+Request-smuggling conflicts — `Transfer-Encoding: chunked` together with
+`Content-Length`, or duplicate conflicting `Content-Length` — always close the
+connection regardless of this flag. Forwarding those verbatim would make the
+proxy a smuggling gadget aimed at the origin.
+
+### Rewrite statistics
+
+The periodic report includes rewrite health. A clean run is one line:
+
+```
+   Rewrite: 1,234 sanitized, 0 anomalies
+```
+
+Problems are itemized by reason, with the last host that triggered each:
+
+```
+   Rewrite: 1,230 sanitized, 4 anomalies
+      head_too_large: 3 (last: api.example.com)
+      framing_conflict: 1 (last: legacy.internal)
+```
 
 ## Quick Start
 
@@ -58,6 +129,9 @@ cargo build --release
 - `--port, -p`: Port to listen on (default: 3129)
 - `--log-level, -l`: Logging level (default: info)
   - Available levels: debug, info, warn, error
+- `--rewrite-fallback`: Forward requests verbatim when rewriting fails, instead
+  of closing the connection. Leaks proxy presence to the origin for each
+  affected request. Off by default (see [Proxy visibility](#proxy-visibility)).
 
 ### Logging
 
@@ -129,7 +203,7 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:3129 %h %p' user@target-host
 #     ServerAliveInterval 60
 ```
 
-`nc -X 5` (OpenBSD netcat) speaks SOCKS5 to the proxy; `ncat --proxy 127.0.0.1:3129 --proxy-type socks5` works equivalently. `ServerAliveInterval` is recommended to keep idle shells alive — although the proxy now allows 1 hour of idle, network middleboxes between you and the target may be stricter.
+`nc -X 5` (OpenBSD netcat) speaks SOCKS5 to the proxy; `ncat --proxy 127.0.0.1:3129 --proxy-type socks5` works equivalently. `ServerAliveInterval` is recommended to keep idle shells alive — although the proxy allows 5 minutes of idle, network middleboxes between you and the target may be stricter.
 
 ## Testing
 
@@ -249,11 +323,12 @@ wrk -t4 -c100 -d30s --timeout 10s http://127.0.0.1:3129/
 
 ### Runtime Limits
 
-- **Max Connections**: 10,000 concurrent connections (configurable via `MAX_CONNECTIONS`)
-- **Connection Timeout**: 10 seconds for initial connection establishment
-- **Idle Timeout**: 1 hour for inactive connections (3600 seconds — tunnel-friendly for SSH and other long-lived streams)
+- **Max Connections**: 1,000 concurrent connections (configurable via `MAX_CONNECTIONS`)
+- **Connection Timeout**: 10 seconds for initial connection establishment (`CONNECT_TIMEOUT`)
+- **Idle Timeout**: 5 minutes for inactive connections (300 seconds — tunnel-friendly for SSH and other long-lived streams)
 - **Max Transfer per Direction**: 64GB per connection to prevent unbounded resource use while accommodating large `scp`/`rsync` flows
-- **Buffer Size**: 64KB for optimal throughput with `TCP_NODELAY`
+- **Buffer Size**: 16KB for low-latency forwarding with `TCP_NODELAY`
+- **Max Request Head**: 64KB per request head (`MAX_REQUEST_HEAD_SIZE`); a larger head is treated as a rewrite anomaly rather than parsed
 - **Stats Flush**: Stats are flushed in batches (STATS_FLUSH_THRESHOLD) rather than per-byte, reducing atomic operations
 
 ### Statistics
