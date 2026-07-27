@@ -91,3 +91,100 @@ fn framing_conflict_is_never_fallback_eligible() {
     assert!(RewriteAnomaly::Unparseable.fallback_eligible());
     assert!(RewriteAnomaly::ObsFoldInRewrittenHeader.fallback_eligible());
 }
+
+#[test]
+fn host_header_takes_authority_from_request_target() {
+    // The request-target authority wins over a disagreeing Host header.
+    assert_sanitized(
+        b"GET http://real.example/ HTTP/1.1\r\nHost: stale.example\r\nAccept: */*\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: real.example\r\nAccept: */*\r\n\r\n",
+    );
+}
+
+#[test]
+fn matching_host_header_is_a_zero_byte_change() {
+    let head = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+    let got = sanitize_request_head(head).unwrap();
+    assert_eq!(
+        got,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n".to_vec()
+    );
+}
+
+#[test]
+fn absent_host_header_is_inserted_first() {
+    // Browsers and curl put Host first; inserting it elsewhere would be a tell.
+    assert_sanitized(
+        b"GET http://example.com/ HTTP/1.1\r\nAccept: */*\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n",
+    );
+}
+
+#[test]
+fn default_http_port_is_stripped_from_host() {
+    assert_sanitized(
+        b"GET http://example.com:80/ HTTP/1.1\r\nHost: example.com:80\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+}
+
+#[test]
+fn non_default_port_is_kept_in_host() {
+    assert_sanitized(
+        b"GET http://example.com:8080/ HTTP/1.1\r\nHost: nope\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n",
+    );
+}
+
+#[test]
+fn port_lookalike_is_not_mistaken_for_default_port() {
+    // "h:8080" ends in "080", not ":80" — must not be truncated.
+    assert_sanitized(
+        b"GET http://h:8080/x HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+        b"GET /x HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+    );
+}
+
+#[test]
+fn host_field_name_casing_and_spacing_are_preserved() {
+    // Only the value changes; the field name's odd casing and the original
+    // whitespace after the colon survive.
+    assert_sanitized(
+        b"GET http://real.example/ HTTP/1.1\r\nhOsT:   stale.example\r\n\r\n",
+        b"GET / HTTP/1.1\r\nhOsT:   real.example\r\n\r\n",
+    );
+}
+
+#[test]
+fn userinfo_is_stripped_from_host() {
+    assert_sanitized(
+        b"GET http://user:pw@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+}
+
+#[test]
+fn ipv6_literal_keeps_brackets_and_loses_default_port() {
+    assert_sanitized(
+        b"GET http://[::1]:80/x HTTP/1.1\r\nHost: [::1]:80\r\n\r\n",
+        b"GET /x HTTP/1.1\r\nHost: [::1]\r\n\r\n",
+    );
+}
+
+#[test]
+fn origin_form_request_keeps_its_existing_host() {
+    // No authority in the target, so there is nothing to correct.
+    assert_sanitized(
+        b"GET /already HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        b"GET /already HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+}
+
+#[test]
+fn non_utf8_header_value_survives_byte_for_byte() {
+    // A latin-1 byte (0xE9 = 'é') in an untouched header must pass through
+    // unchanged. This is the case a lossy comparison would silently accept.
+    let input: &[u8] = b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nX-Note: caf\xe9\r\n\r\n";
+    let expected: &[u8] = b"GET / HTTP/1.1\r\nHost: e.example\r\nX-Note: caf\xe9\r\n\r\n";
+    assert_sanitized(input, expected);
+}

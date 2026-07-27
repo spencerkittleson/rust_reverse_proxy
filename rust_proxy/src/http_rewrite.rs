@@ -134,6 +134,42 @@ fn host_from_authority(authority: &[u8], scheme: &[u8]) -> Vec<u8> {
     host_port.to_vec()
 }
 
+/// Field name of a header line, or `None` if it has no colon.
+pub fn header_name(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    Some(&line[..colon])
+}
+
+/// Whether a header line's field name equals `name`, case-insensitively.
+pub fn name_is(line: &[u8], name: &[u8]) -> bool {
+    header_name(line).is_some_and(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// True for a deprecated `obs-fold` continuation line.
+pub fn is_obs_fold(line: &[u8]) -> bool {
+    matches!(line.first(), Some(b' ') | Some(b'\t'))
+}
+
+/// Replace a header line's value, preserving the field name bytes exactly and
+/// the original optional whitespace between the colon and the value.
+pub fn replace_header_value(line: &[u8], new_value: &[u8]) -> Vec<u8> {
+    let colon = match line.iter().position(|&b| b == b':') {
+        Some(i) => i,
+        None => return line.to_vec(),
+    };
+    let after = &line[colon + 1..];
+    let ws = after
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(after.len());
+
+    let mut out = Vec::with_capacity(colon + 1 + ws + new_value.len());
+    out.extend_from_slice(&line[..=colon]);
+    out.extend_from_slice(&after[..ws]);
+    out.extend_from_slice(new_value);
+    out
+}
+
 /// Rule 1: absolute-form request-target becomes origin-form.
 ///
 /// Returns the rewritten line and the `Host` value implied by the target, which
@@ -174,15 +210,30 @@ fn rewrite_request_line(line: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RewriteAnomal
 /// Rewrite one complete request head into the form a direct client would send.
 pub fn sanitize_request_head(head: &[u8]) -> Result<Vec<u8>, RewriteAnomaly> {
     let (request_line, header_lines) = split_head(head).ok_or(RewriteAnomaly::Unparseable)?;
-    let (new_request_line, _authority) = rewrite_request_line(request_line)?;
+    let (new_request_line, authority) = rewrite_request_line(request_line)?;
 
     let mut out = Vec::with_capacity(head.len() + 32);
     out.extend_from_slice(&new_request_line);
     out.extend_from_slice(CRLF);
-    for line in &header_lines {
-        out.extend_from_slice(line);
+
+    // Rule 2: insert Host first when the client omitted it. First is where
+    // browsers and curl put it.
+    let has_host = header_lines.iter().any(|l| name_is(l, b"Host"));
+    if !has_host && !authority.is_empty() {
+        out.extend_from_slice(b"Host: ");
+        out.extend_from_slice(&authority);
         out.extend_from_slice(CRLF);
     }
+
+    for line in &header_lines {
+        if name_is(line, b"Host") && !authority.is_empty() {
+            out.extend_from_slice(&replace_header_value(line, &authority));
+        } else {
+            out.extend_from_slice(line);
+        }
+        out.extend_from_slice(CRLF);
+    }
+
     out.extend_from_slice(CRLF);
     Ok(out)
 }
