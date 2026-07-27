@@ -3,7 +3,10 @@ use std::process::Command;
 #[cfg(windows)]
 use log::{info, warn, debug};
 #[cfg(windows)]
-use winapi::um::winuser::{MessageBoxW, MB_YESNO, IDYES};
+use winapi::um::winuser::{
+    FindWindowW, MessageBoxW, PostMessageW, IDNO, IDYES, MB_SETFOREGROUND, MB_SYSTEMMODAL,
+    MB_YESNO, WM_COMMAND,
+};
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
@@ -11,23 +14,65 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::iter::once;
 
+/// How long to wait for a human to answer the setup prompt before giving up.
+#[cfg(windows)]
+const SETUP_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask whether to run the setup script, auto-declining after
+/// `SETUP_PROMPT_TIMEOUT` if nobody answers.
+///
+/// The dialog must never block startup indefinitely. When the proxy is launched
+/// non-interactively (an SSH session, a service, a scheduled task) there may be
+/// no desktop to click on, and an unbounded modal would hang the process before
+/// it ever binds its port. Timing out and declining is the safe default: setup
+/// only applies optional Windows optimizations, so skipping it degrades
+/// gracefully, whereas hanging does not.
 #[cfg(windows)]
 fn prompt_for_setup() -> bool {
+    // Dialog-class window, used to find and dismiss our own message box.
+    const DIALOG_CLASS: &str = "#32770";
     let message = "Do you want to run the setup script to configure the environment?";
-    let title = "Setup";
-    let wide_message: Vec<u16> = OsStr::new(message).encode_wide().chain(once(0u16)).collect();
-    let wide_title: Vec<u16> = OsStr::new(title).encode_wide().chain(once(0u16)).collect();
+    let title = "rust_proxy Setup";
 
-    let result = unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            wide_message.as_ptr(),
-            wide_title.as_ptr(),
-            MB_YESNO,
-        )
-    };
+    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(once(0u16)).collect() };
+    let (wide_message, wide_title) = (wide(message), wide(title));
+    let (wide_class_find, wide_title_find) = (wide(DIALOG_CLASS), wide(title));
 
-    result == IDYES
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                wide_message.as_ptr(),
+                wide_title.as_ptr(),
+                // System-modal and foreground so the prompt is actually visible
+                // when a desktop does exist.
+                MB_YESNO | MB_SETFOREGROUND | MB_SYSTEMMODAL,
+            )
+        };
+        // A closed receiver just means we already timed out; nothing to do.
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(SETUP_PROMPT_TIMEOUT) {
+        Ok(result) => result == IDYES,
+        Err(_) => {
+            info!(
+                "Setup prompt unanswered after {}s — continuing without setup.",
+                SETUP_PROMPT_TIMEOUT.as_secs()
+            );
+            // Dismiss the orphaned dialog so it cannot linger on a desktop or
+            // keep its thread parked. MB_YESNO has no close button, so WM_CLOSE
+            // is ignored; posting the "No" command is what actually dismisses it.
+            unsafe {
+                let hwnd = FindWindowW(wide_class_find.as_ptr(), wide_title_find.as_ptr());
+                if !hwnd.is_null() {
+                    PostMessageW(hwnd, WM_COMMAND, IDNO as usize, 0);
+                }
+            }
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
