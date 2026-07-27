@@ -476,6 +476,9 @@ pub struct RequestStream {
     max_head: usize,
     policy: RewritePolicy,
     anomalies: Vec<RewriteAnomaly>,
+    /// Cumulative, for tests and diagnostics.
+    requests_sanitized_total: u64,
+    /// Undrained delta, for the stats layer.
     requests_sanitized: u64,
     upgrade_offered: bool,
     response_head: Vec<u8>,
@@ -489,6 +492,7 @@ impl RequestStream {
             max_head,
             policy,
             anomalies: Vec::new(),
+            requests_sanitized_total: 0,
             requests_sanitized: 0,
             upgrade_offered: false,
             response_head: Vec::new(),
@@ -499,8 +503,22 @@ impl RequestStream {
         matches!(self.state, State::Passthrough)
     }
 
+    #[allow(clippy::misnamed_getters)] // Intentional: returns the cumulative
+    // total; `requests_sanitized` is the drainable delta for the stats layer.
     pub fn requests_sanitized(&self) -> u64 {
-        self.requests_sanitized
+        self.requests_sanitized_total
+    }
+
+    /// Drain the sanitized-request count. Destructive, mirroring
+    /// `take_anomalies`, so the I/O layer can flush counters on every read
+    /// without double-counting. `requests_sanitized()` remains the cumulative
+    /// accessor used by tests.
+    pub fn take_sanitized(&mut self) -> u64 {
+        std::mem::take(&mut self.requests_sanitized)
+    }
+
+    pub fn is_fallback(&self) -> bool {
+        self.policy == RewritePolicy::Fallback
     }
 
     pub fn upgrade_offered(&self) -> bool {
@@ -609,6 +627,7 @@ impl RequestStream {
 
         out.extend_from_slice(&sanitized);
         self.requests_sanitized += 1;
+        self.requests_sanitized_total += 1;
         if offers_upgrade(head) {
             self.upgrade_offered = true;
             self.response_head.clear();

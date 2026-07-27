@@ -299,6 +299,22 @@ pub async fn handle_client(client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
     result
 }
 
+/// Move counters out of a `RequestStream` and into `ProxyStats`.
+///
+/// `forwarded` marks a real leak: only fallback-eligible anomalies under
+/// `--rewrite-fallback` actually put unrewritten bytes on the wire.
+pub fn flush_rewrite_stats(
+    stream: &mut crate::http_rewrite::RequestStream,
+    stats: &ProxyStats,
+    host: &str,
+    fallback: bool,
+) {
+    stats.record_sanitized(stream.take_sanitized());
+    for anomaly in stream.take_anomalies() {
+        stats.record_anomaly(anomaly, host, fallback && anomaly.fallback_eligible());
+    }
+}
+
 async fn connect_and_tunnel(
     mut client_socket: TcpStream,
     host: &str,
@@ -317,7 +333,7 @@ async fn connect_and_tunnel(
             } else {
                 client_socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
             }
-            tunnel_fast(client_socket, remote, stats).await
+            tunnel_fast(client_socket, remote, None, host, stats).await
         }
         Ok(Err(e)) => {
             on_error(&e);
@@ -484,7 +500,7 @@ async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
             debug!("SOCKS5 connected to {}:{}", host, port);
             // 0x00 = succeeded
             send_reply(&mut client_socket, 0x00).await?;
-            tunnel_fast(client_socket, remote, stats.clone()).await?;
+            tunnel_fast(client_socket, remote, None, host.as_str(), stats.clone()).await?;
         }
         Ok(Err(e)) => {
             analyze_ssl_error(&host, port, &e);
@@ -587,7 +603,24 @@ fn configure_client_socket(client: &TcpStream) {
     set_keepalive(client.as_raw_socket() as _, &ka);
 }
 
-async fn tunnel_fast(mut src: TcpStream, mut dst: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+/// Rewriter state shared by the two halves of a plain-HTTP relay.
+///
+/// A `std::sync::Mutex` is correct here: it is only ever held for a synchronous
+/// state-machine step, never across an await. `upgrade_watch` lets the response
+/// half skip locking entirely, which keeps it a blind relay for all normal
+/// traffic — the lock is touched only while an upgrade offer is outstanding.
+struct RewriteShared {
+    stream: Mutex<crate::http_rewrite::RequestStream>,
+    upgrade_watch: AtomicBool,
+}
+
+async fn tunnel_fast(
+    mut src: TcpStream,
+    mut dst: TcpStream,
+    rewrite: Option<crate::http_rewrite::RequestStream>,
+    host: &str,
+    stats: Arc<ProxyStats>,
+) -> Result<(), ProxyError> {
     src.set_nodelay(true)?;
     dst.set_nodelay(true)?;
     // `src` is the client; `dst` is the origin and keeps OS defaults.
@@ -596,34 +629,122 @@ async fn tunnel_fast(mut src: TcpStream, mut dst: TcpStream, stats: Arc<ProxySta
     let (mut src_reader, mut src_writer) = src.split();
     let (mut dst_reader, mut dst_writer) = dst.split();
 
-    // Stream data with size limits and idle timeout
-    let stats_clone = stats.clone();
-    let client_to_server = bounded_copy_with_stats(
-        &mut src_reader, &mut dst_writer, MAX_DOWNLOAD_SIZE, IDLE_TIMEOUT,
-        "client->server", stats_clone
-    );
-    let stats_clone = stats.clone();
-    let server_to_client = bounded_copy_with_stats(
-        &mut dst_reader, &mut src_writer, MAX_DOWNLOAD_SIZE, IDLE_TIMEOUT,
-        "server->client", stats_clone
-    );
+    match rewrite {
+        // CONNECT and SOCKS5: opaque both ways, zero parsing cost.
+        None => {
+            let client_to_server = bounded_copy_with_stats(
+                &mut src_reader,
+                &mut dst_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "client->server",
+                stats.clone(),
+            );
+            let server_to_client = bounded_copy_with_stats(
+                &mut dst_reader,
+                &mut src_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "server->client",
+                stats.clone(),
+            );
+            tokio::try_join!(client_to_server, server_to_client)?;
+        }
+        Some(stream) => {
+            let fallback = stream.is_fallback();
+            let shared = Arc::new(RewriteShared {
+                stream: Mutex::new(stream),
+                upgrade_watch: AtomicBool::new(false),
+            });
 
-    tokio::try_join!(client_to_server, server_to_client)?;
+            let out_shared = shared.clone();
+            let out_stats = stats.clone();
+            let out_host = host.to_string();
+            let client_to_server = copy_loop(
+                &mut src_reader,
+                &mut dst_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "client->server",
+                stats.clone(),
+                move |chunk| {
+                    let mut rewritten = Vec::with_capacity(chunk.len() + 64);
+                    let mut guard = out_shared
+                        .stream
+                        .lock()
+                        .map_err(|_| ProxyError::from("rewriter lock poisoned"))?;
+                    let result = guard.push(chunk, &mut rewritten);
+                    flush_rewrite_stats(&mut guard, &out_stats, &out_host, fallback);
+                    out_shared
+                        .upgrade_watch
+                        .store(guard.upgrade_offered(), Ordering::Relaxed);
+                    drop(guard);
+
+                    if let Err(anomaly) = result {
+                        // Mid-stream, so no status line can be injected; closing
+                        // is the only option that does not leak.
+                        warn!(
+                            "Rewrite anomaly '{}' for {} — closing connection",
+                            anomaly.name(),
+                            out_host
+                        );
+                        return Err(ProxyError::from("rewrite anomaly"));
+                    }
+                    Ok(Transformed::Replaced(rewritten))
+                },
+            );
+
+            let in_shared = shared.clone();
+            let server_to_client = copy_loop(
+                &mut dst_reader,
+                &mut src_writer,
+                MAX_DOWNLOAD_SIZE,
+                IDLE_TIMEOUT,
+                "server->client",
+                stats.clone(),
+                move |chunk| {
+                    // One atomic load in the common case; no lock, no copy.
+                    if in_shared.upgrade_watch.load(Ordering::Relaxed) {
+                        if let Ok(mut guard) = in_shared.stream.lock() {
+                            guard.observe_response(chunk);
+                            if !guard.upgrade_offered() {
+                                in_shared.upgrade_watch.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Ok(Transformed::Verbatim)
+                },
+            );
+
+            tokio::try_join!(client_to_server, server_to_client)?;
+        }
+    }
+
     Ok(())
 }
 
-// Copy with size limits and statistics tracking
-pub async fn bounded_copy_with_stats<R, W>(
+/// What a copy hook decided to do with a chunk.
+pub enum Transformed {
+    /// Write the input bytes through unchanged.
+    Verbatim,
+    /// Write these bytes instead (possibly empty).
+    Replaced(Vec<u8>),
+}
+
+/// Shared copy loop: idle timeout, byte cap, stats flushing, FIN propagation.
+async fn copy_loop<R, W, F>(
     mut reader: R,
     mut writer: W,
     max_size: u64,
     idle_timeout: Duration,
     direction: &str,
     stats: Arc<ProxyStats>,
+    mut hook: F,
 ) -> Result<(), ProxyError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
+    F: FnMut(&[u8]) -> Result<Transformed, ProxyError>,
 {
     let mut bytes_read = 0u64;
     let mut last_flushed = 0u64;
@@ -640,7 +761,9 @@ where
             Ok(Ok(n)) => {
                 bytes_read += n as u64;
                 if (bytes_read - last_flushed) >= STATS_FLUSH_THRESHOLD {
-                    stats.bytes_transferred.fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
+                    stats
+                        .bytes_transferred
+                        .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
                     last_flushed = bytes_read;
                 }
 
@@ -649,7 +772,16 @@ where
                     return Err("Download size limit exceeded".into());
                 }
 
-                let write_result = timeout(idle_timeout, writer.write_all(&buffer[..n])).await;
+                let transformed = hook(&buffer[..n])?;
+                let payload: &[u8] = match &transformed {
+                    Transformed::Verbatim => &buffer[..n],
+                    Transformed::Replaced(bytes) => bytes,
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+
+                let write_result = timeout(idle_timeout, writer.write_all(payload)).await;
                 match write_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
@@ -674,9 +806,36 @@ where
     }
 
     if bytes_read > last_flushed {
-        stats.bytes_transferred.fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
+        stats
+            .bytes_transferred
+            .fetch_add(bytes_read - last_flushed, Ordering::Relaxed);
     }
 
     Ok(())
+}
+
+// Copy with size limits and statistics tracking
+pub async fn bounded_copy_with_stats<R, W>(
+    reader: R,
+    writer: W,
+    max_size: u64,
+    idle_timeout: Duration,
+    direction: &str,
+    stats: Arc<ProxyStats>,
+) -> Result<(), ProxyError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    copy_loop(
+        reader,
+        writer,
+        max_size,
+        idle_timeout,
+        direction,
+        stats,
+        |_| Ok(Transformed::Verbatim),
+    )
+    .await
 }
 
