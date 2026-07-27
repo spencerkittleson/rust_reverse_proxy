@@ -72,14 +72,20 @@ Create `rust_proxy/tests/http_rewrite_tests.rs`:
 ```rust
 use rust_proxy::http_rewrite::{sanitize_request_head, RewriteAnomaly};
 
-/// Assert byte-exact output. Renders as text on failure, which matters because
-/// the whole point of this module is exact bytes.
+/// Assert byte-exact output.
+///
+/// Compares the raw slices — NOT lossy strings, which would collapse any
+/// non-UTF-8 divergence to U+FFFD on both sides and compare equal. Byte identity
+/// is this module's entire contract, so the guard for it must be byte-exact.
+/// Lossy rendering appears only in the failure message, for readability.
 fn assert_sanitized(input: &[u8], expected: &[u8]) {
     let got = sanitize_request_head(input).expect("should sanitize");
     assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
         String::from_utf8_lossy(&got),
-        String::from_utf8_lossy(expected),
-        "byte mismatch"
+        String::from_utf8_lossy(expected)
     );
 }
 
@@ -888,6 +894,85 @@ This is the task that justifies the whole architecture. A one-shot rewrite at co
 - Consumes: `sanitize_request_head`, `RewriteAnomaly`, `find`, `split_head`, `name_is`, `header_value`, `trim` from Tasks 1-3.
 - Produces: `RewritePolicy { FailClosed, Fallback }`; `RequestStream::new(policy: RewritePolicy, max_head: usize)`, `push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), RewriteAnomaly>`, `take_anomalies(&mut self) -> Vec<RewriteAnomaly>`, `requests_sanitized(&self) -> u64`, `is_passthrough(&self) -> bool`. Task 5 adds upgrade methods; Tasks 8 and 10 call `push` and `take_anomalies`.
 
+- [ ] **Step 0: Fix the orphaned obs-fold hole from Task 3 (carry-forward)**
+
+The Task 3 review found a byte-integrity gap in `sanitize_request_head`: the
+obs-fold guard only fires when a fold follows a header in the hard-coded
+`rewritten` set (`Host`/`Connection`/`Proxy-Connection`/`Proxy-Authorization`).
+A fold continuing a header that **rule 5 drops** (a header named by a
+non-forwardable `Connection` token) is neither flagged nor dropped — pass 2
+emits it as an orphaned continuation line. That is a malformed byte on the wire,
+exactly what this module exists to prevent, so it must fail closed.
+
+In `rust_proxy/src/http_rewrite.rs`, the `rewritten` closure and its scan
+currently read:
+
+```rust
+    // A rewritten header cannot be safely edited if a fold continues its value.
+    let rewritten = |line: &[u8]| {
+        name_is(line, b"Host")
+            || name_is(line, b"Connection")
+            || name_is(line, b"Proxy-Connection")
+            || name_is(line, b"Proxy-Authorization")
+    };
+    for pair in header_lines.windows(2) {
+        if rewritten(pair[0]) && is_obs_fold(pair[1]) {
+            return Err(RewriteAnomaly::ObsFoldInRewrittenHeader);
+        }
+    }
+```
+
+Replace that block with one that also covers rule-5-dropped headers. Note
+`named_hop_by_hop` is already computed just above this point:
+
+```rust
+    // A header whose value pass 2 rewrites OR drops cannot carry an obs-fold
+    // continuation safely: rewriting can't see past the first line, and dropping
+    // the header would orphan the fold onto its own line. Both fail closed.
+    let touched = |line: &[u8]| {
+        name_is(line, b"Host")
+            || name_is(line, b"Connection")
+            || name_is(line, b"Proxy-Connection")
+            || name_is(line, b"Proxy-Authorization")
+            || named_hop_by_hop.iter().any(|t| name_is(line, t.as_slice()))
+    };
+    for pair in header_lines.windows(2) {
+        if touched(pair[0]) && is_obs_fold(pair[1]) {
+            return Err(RewriteAnomaly::ObsFoldInRewrittenHeader);
+        }
+    }
+```
+
+Add a regression test to `rust_proxy/tests/http_rewrite_tests.rs` proving the
+orphan case now fails closed:
+
+```rust
+#[test]
+fn obs_fold_on_a_dropped_hop_by_hop_header_fails_closed() {
+    // X-Hop is named by a Connection token, so rule 5 drops it. A fold
+    // continuing X-Hop must not be orphaned onto the wire — fail closed.
+    assert_eq!(
+        sanitize_request_head(
+            b"GET http://e.example/ HTTP/1.1\r\nHost: e.example\r\nConnection: keep-alive, X-Hop\r\nX-Hop: a\r\n\tb\r\n\r\n"
+        ),
+        Err(RewriteAnomaly::ObsFoldInRewrittenHeader)
+    );
+}
+```
+
+Run: `cargo test --test http_rewrite_tests`
+Expected: the new test passes; all previously-passing tests still pass. Commit
+this fix separately before starting the `RequestStream` work below:
+
+```bash
+git add rust_proxy/src/http_rewrite.rs rust_proxy/tests/http_rewrite_tests.rs
+git commit -m "fix: fail closed on obs-fold continuing a rule-5-dropped header
+
+The obs-fold guard only covered explicitly-rewritten headers, so a fold
+continuing a Connection-named hop-by-hop header that rule 5 drops was orphaned
+onto its own line instead of failing closed."
+```
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `rust_proxy/tests/http_rewrite_tests.rs`:
@@ -924,9 +1009,11 @@ fn every_request_on_a_reused_connection_is_rewritten() {
     for chunk in [1usize, 7, 64, 4096] {
         let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
         assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
             String::from_utf8_lossy(&got),
-            String::from_utf8_lossy(expected),
-            "failed at chunk size {chunk}"
+            String::from_utf8_lossy(expected)
         );
         assert!(
             !got.windows(7).any(|w| w == b"http://"),
@@ -945,6 +1032,9 @@ fn mid_stream_origin_form_request_is_supported_not_an_anomaly() {
                      GET /two HTTP/1.1\r\nHost: e.example\r\nConnection: close\r\n\r\n";
     let got = drive(RewritePolicy::FailClosed, input, 1).unwrap();
     assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
         String::from_utf8_lossy(&got),
         String::from_utf8_lossy(expected)
     );
@@ -959,9 +1049,11 @@ fn content_length_body_is_relayed_verbatim() {
     for chunk in [1usize, 3, 4096] {
         let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
         assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
             String::from_utf8_lossy(&got),
-            String::from_utf8_lossy(expected),
-            "failed at chunk size {chunk}"
+            String::from_utf8_lossy(expected)
         );
     }
 }
@@ -977,9 +1069,11 @@ fn chunked_body_is_relayed_verbatim_and_next_request_is_rewritten() {
     for chunk in [1usize, 5, 4096] {
         let got = drive(RewritePolicy::FailClosed, input, chunk).unwrap();
         assert_eq!(
+            got,
+            expected.to_vec(),
+            "failed at chunk size {chunk}\n     got: {:?}\nexpected: {:?}",
             String::from_utf8_lossy(&got),
-            String::from_utf8_lossy(expected),
-            "failed at chunk size {chunk}"
+            String::from_utf8_lossy(expected)
         );
     }
 }
@@ -994,6 +1088,9 @@ fn chunked_trailers_are_relayed_and_end_the_body() {
                      GET /y HTTP/1.1\r\nHost: e.example\r\n\r\n";
     let got = drive(RewritePolicy::FailClosed, input, 1).unwrap();
     assert_eq!(
+        got,
+        expected.to_vec(),
+        "byte mismatch\n     got: {:?}\nexpected: {:?}",
         String::from_utf8_lossy(&got),
         String::from_utf8_lossy(expected)
     );
