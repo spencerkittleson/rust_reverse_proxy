@@ -146,9 +146,14 @@ Exactly five edits, applied in the numbered order below — rule 5 operates on t
 
 5. **Hop-by-hop cleanup, RFC 7230 §6.1.** For each token listed in `Connection`,
    drop the header it names. Then *reduce* `Connection` to its surviving
-   end-to-end tokens, where the only tokens kept are `keep-alive` and `close`; if
-   neither survives, drop the `Connection` line. Reduce only — never invent a
-   token the client did not send.
+   forwardable tokens — exactly `keep-alive`, `close`, and `upgrade`; if none
+   survive, drop the `Connection` line. Reduce only — never invent a token the
+   client did not send.
+
+   `upgrade` is deliberately forwardable even though RFC 7230 classes it
+   hop-by-hop. Dropping it, and with it the `Upgrade` header it names, would make
+   the `Upgrade` passthrough described below unreachable. A proxy that intends to
+   relay an upgrade must forward the offer.
 
 ### Codified prohibitions
 
@@ -194,6 +199,11 @@ immediately, through the broken request.
 client that the rewriter mishandles, at the cost of leaking on each occurrence.
 The health report displays a persistent banner while the flag is active so the
 trade is never silent.
+
+When fallback fires, the connection also switches permanently to `Passthrough`.
+The parse that just failed is the same parse that would locate the next request
+boundary, so continuing to parse after forwarding an unrewritten head would be
+guesswork. One leak per connection, not a desynchronized stream.
 
 The residual anomaly set, after the head cap increase:
 
@@ -350,9 +360,15 @@ once direct and once through the proxy, and the two recordings must be
 byte-identical. This validates the guiding principle instead of testing the rules
 back to themselves, so it catches leaks not enumerated above.
 
-**One existing assertion inverts.** `tests/integration_tests.rs:61` asserts the
-origin receives absolute form. That assertion flips and becomes the permanent
-regression guard for this feature.
+**No existing assertion inverts, and that is the problem.** An earlier draft of
+this spec claimed `tests/integration_tests.rs:61` asserts the origin receives
+absolute form. It does not — line 61 is the *client's* request **to** the proxy,
+which correctly remains absolute form forever, and `unit_tests.rs:62` likewise
+asserts a client-side parse. The echo server at `integration_tests.rs:36-45`
+reads the request into a buffer and discards it. **No current test inspects what
+the origin receives**, which is precisely why this leak survived. The golden
+byte-equality harness is therefore new coverage, not a modified assertion, and it
+is the permanent regression guard for this feature.
 
 ## Docs
 
