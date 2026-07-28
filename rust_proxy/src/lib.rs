@@ -32,6 +32,15 @@ pub const STATS_FLUSH_THRESHOLD: u64 = 65536;
 /// likeliest source of spurious rewrite anomalies.
 pub const MAX_REQUEST_HEAD_SIZE: usize = 65536;
 
+/// Client-facing challenge. `Connection: close` removes any question about
+/// stream state after a rejection; clients reconnect and retry, which is
+/// ordinary Basic behavior. No `Server` and no `Date`, matching the 502s.
+pub const PROXY_AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+    Proxy-Authenticate: Basic realm=\"rust_proxy\"\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\
+    \r\n";
+
 // Statistics tracking
 #[derive(Debug)]
 pub struct ProxyStats {
@@ -604,6 +613,23 @@ async fn handle_http(
 
     if parts.len() < 3 {
         return Ok(());
+    }
+
+    // Before any origin dial: an unauthenticated client must not be able to
+    // make this proxy open an outbound connection. This is also the last point
+    // at which a status line can still be sent to the client.
+    if let Some(creds) = config.auth.as_deref() {
+        let outcome = creds.check_head(&raw_headers);
+        if !outcome.is_granted() {
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            let peer = client_socket
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            warn!("Refusing request from {}: {}", peer, outcome.reason());
+            client_socket.write_all(PROXY_AUTH_REQUIRED).await?;
+            return Ok(());
+        }
     }
 
     let method = parts[0];

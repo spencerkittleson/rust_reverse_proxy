@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use rust_proxy::auth::Credentials;
 use rust_proxy::http_rewrite::RewritePolicy;
 use rust_proxy::{handle_client, Ordering, ProxyStats, RuntimeConfig};
 
@@ -55,7 +56,7 @@ async fn proxy_roundtrip_with(
 ) -> (Vec<u8>, Arc<ProxyStats>) {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
-    let origin_task = tokio::spawn(recording_origin(origin));
+    let origin_task = tokio::spawn(recording_origin_or_nothing(origin));
 
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
@@ -82,6 +83,23 @@ async fn proxy_roundtrip_with(
 
     let received = origin_task.await.unwrap();
     (received, stats)
+}
+
+/// Origin that records bytes but gives up if it is never dialed.
+///
+/// A refused request means the proxy never connects, so a bare
+/// `recording_origin` would block on `accept` forever. Returning an empty
+/// recording is exactly the observation the auth tests need.
+async fn recording_origin_or_nothing(listener: TcpListener) -> Vec<u8> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        recording_origin(listener),
+    )
+    .await
+    {
+        Ok(received) => received,
+        Err(_) => Vec::new(),
+    }
 }
 
 #[tokio::test]
@@ -144,4 +162,124 @@ async fn proxy_never_injects_identifying_headers() {
     for banned in ["via:", "x-forwarded-for", "forwarded:", "x-real-ip"] {
         assert!(!lowered.contains(banned), "{banned} present in {lowered:?}");
     }
+}
+
+fn auth_config(file_contents: &str) -> Arc<RuntimeConfig> {
+    Arc::new(RuntimeConfig {
+        policy: RewritePolicy::FailClosed,
+        auth: Some(Arc::new(
+            Credentials::parse_file_contents(file_contents).unwrap(),
+        )),
+        allow_from: Vec::new(),
+    })
+}
+
+#[tokio::test]
+async fn unauthenticated_request_never_reaches_the_origin() {
+    // The check has to happen before the origin dial, so the origin must see
+    // nothing at all — not even a connection's worth of zero bytes.
+    let request = b"GET http://ORIGIN/secret HTTP/1.1\r\nHost: ORIGIN\r\n\r\n";
+    let (received, stats) = proxy_roundtrip_with(request, auth_config("user:secret")).await;
+    assert!(
+        received.is_empty(),
+        "origin saw bytes from an unauthenticated client: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_wrong_password_never_reaches_the_origin() {
+    // base64("user:wrong")
+    let request = b"GET http://ORIGIN/secret HTTP/1.1\r\nHost: ORIGIN\r\n\
+                    Proxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n";
+    let (received, stats) = proxy_roundtrip_with(request, auth_config("user:secret")).await;
+    assert!(received.is_empty(), "{:?}", String::from_utf8_lossy(&received));
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn an_authenticated_request_reaches_the_origin_without_the_credential() {
+    // base64("user:secret"). Rule 4 already drops Proxy-Authorization, so the
+    // credential must not appear upstream and the request must be rewritten to
+    // origin form as usual.
+    let request = b"GET http://ORIGIN/ok HTTP/1.1\r\nHost: ORIGIN\r\n\
+                    Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n";
+    let (received, stats) = proxy_roundtrip_with(request, auth_config("user:secret")).await;
+    let text = String::from_utf8(received.clone()).expect("origin bytes must be UTF-8 here");
+    assert!(text.starts_with("GET /ok HTTP/1.1\r\n"), "{text:?}");
+    assert!(
+        !text.to_lowercase().contains("proxy-authorization"),
+        "credential leaked upstream: {text:?}"
+    );
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.requests_sanitized.load(Ordering::Relaxed), 1);
+}
+
+/// Send `request` (with `ORIGIN` replaced by a listener that never accepts) to
+/// an authenticating proxy and return the client-visible response bytes plus
+/// the proxy's stats. Used by the tests that need to inspect the 407 itself,
+/// which `proxy_roundtrip_with` cannot show because it reports origin bytes.
+async fn challenge_for(request_template: &str) -> (Vec<u8>, Arc<ProxyStats>) {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let stats = Arc::new(ProxyStats::new());
+    let stats_for_proxy = stats.clone();
+    let config = auth_config("user:secret");
+    tokio::spawn(async move {
+        let (socket, _) = proxy.accept().await.unwrap();
+        let _ = handle_client(socket, stats_for_proxy, config).await;
+    });
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let wire = request_template.replace("ORIGIN", &origin_addr.to_string());
+    client.write_all(wire.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut response),
+    )
+    .await;
+    drop(origin);
+    (response, stats)
+}
+
+#[tokio::test]
+async fn an_unauthenticated_client_is_told_how_to_authenticate() {
+    // A bare close would leave a client guessing. The 407 must name the scheme
+    // and must not carry Server or Date.
+    let (response, _stats) =
+        challenge_for("GET http://ORIGIN/x HTTP/1.1\r\nHost: ORIGIN\r\n\r\n").await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 407 "), "{text:?}");
+    assert!(text.contains("Proxy-Authenticate: Basic"), "{text:?}");
+    let lowered = text.to_lowercase();
+    assert!(!lowered.contains("\r\nserver:"), "{text:?}");
+    assert!(!lowered.contains("\r\ndate:"), "{text:?}");
+}
+
+#[tokio::test]
+async fn unauthenticated_connect_is_refused_before_the_tunnel_opens() {
+    let (response, stats) =
+        challenge_for("CONNECT ORIGIN HTTP/1.1\r\nHost: ORIGIN\r\n\r\n").await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 407 "), "{text:?}");
+    assert!(
+        !text.contains("200 Connection Established"),
+        "a tunnel was acknowledged to an unauthenticated client: {text:?}"
+    );
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn allow_anonymous_leaves_http_behavior_unchanged() {
+    let request = b"GET http://ORIGIN/plain HTTP/1.1\r\nHost: ORIGIN\r\n\r\n";
+    let (received, stats) = proxy_roundtrip(request, RewritePolicy::FailClosed).await;
+    let text = String::from_utf8(received).unwrap();
+    assert!(text.starts_with("GET /plain HTTP/1.1\r\n"), "{text:?}");
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 0);
 }
