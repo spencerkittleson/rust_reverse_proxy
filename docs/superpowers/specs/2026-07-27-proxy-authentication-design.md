@@ -113,7 +113,8 @@ the project exists to protect.
   colons.
 - Trailing whitespace in the password is **preserved** (only the single `\r` is
   removed), because a password may legitimately end in a space.
-- An empty username is an error. A line with no colon is an error.
+- An empty username is an error. An empty password is an error. A line with no
+  colon is an error.
 - A file that parses to zero valid entries is a startup error, never a silent
   fallback to no authentication.
 - On Unix, warn if the file mode grants group or world read. Skipped on
@@ -205,8 +206,22 @@ Silence is correct: a scanner should not learn that a proxy is listening.
 
 In `handle_http` after the head is read (lib.rs:446) and before any origin
 dial. Locate `Proxy-Authorization`, require the `Basic` scheme
-(case-insensitive), base64-decode, split the decoded value on the first colon,
-and compare in constant time against each configured credential.
+(case-insensitive), base64-decode, then compare the whole decoded
+`user:password` byte string in constant time against each configured
+credential's joined form.
+
+Not splitting the decoded value is equivalent to splitting it — stored
+usernames cannot contain a colon, because the file format splits on the first
+one — and it avoids a parse step on attacker-controlled bytes. The SOCKS5 path,
+which receives username and password as separate length-prefixed fields, joins
+them the same way and additionally rejects any presented username containing a
+colon, so `user="a:b", pass="c"` cannot be confused with a stored
+`("a", "b:c")`.
+
+**More than one `Proxy-Authorization` header is a rejection**, not a
+first-wins or last-wins choice. Two conflicting credentials in one head is the
+same class of ambiguity as conflicting `Content-Length`, and this project
+resolves ambiguity by failing closed.
 
 On failure, write exactly these bytes and nothing else:
 
