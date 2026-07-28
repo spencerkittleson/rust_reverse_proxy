@@ -6,6 +6,7 @@
 //! `Args`, mirroring `Args::rewrite_policy()`.
 
 use base64::Engine as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A configuration problem worth refusing to start over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,4 +247,87 @@ fn basic_token(value: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(token)
+}
+
+/// An address or prefix that may open a connection to this proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr {
+    base: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    /// Parse `addr` or `addr/prefix`. A bare address is a host route.
+    pub fn parse(s: &str) -> Result<Cidr, ConfigError> {
+        let s = s.trim();
+        let (addr_part, prefix_part) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+        let parsed: IpAddr = addr_part
+            .parse()
+            .map_err(|_| ConfigError(format!("not an IP address: {addr_part:?}")))?;
+        let base = normalize(parsed);
+        let max = if base.is_ipv4() { 32u8 } else { 128u8 };
+        let prefix = match prefix_part {
+            None => max,
+            Some(p) => {
+                let n: u8 = p
+                    .parse()
+                    .map_err(|_| ConfigError(format!("not a prefix length: {p:?}")))?;
+                if n > max {
+                    return Err(ConfigError(format!("prefix /{n} is too large for {base}")));
+                }
+                n
+            }
+        };
+        Ok(Cidr { base, prefix })
+    }
+
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        match (self.base, normalize(addr)) {
+            (IpAddr::V4(b), IpAddr::V4(a)) => {
+                masked_v4(b, self.prefix) == masked_v4(a, self.prefix)
+            }
+            (IpAddr::V6(b), IpAddr::V6(a)) => {
+                masked_v6(b, self.prefix) == masked_v6(a, self.prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// True when `addr` may connect. An empty list means no filtering at all,
+/// not deny-all.
+pub fn addr_allowed(list: &[Cidr], addr: IpAddr) -> bool {
+    list.is_empty() || list.iter().any(|c| c.contains(addr))
+}
+
+/// A v4 client arriving on a dual-stack socket appears as `::ffff:a.b.c.d`.
+/// Normalizing both rule and source means a v4 prefix matches it.
+fn normalize(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+fn masked_v4(a: Ipv4Addr, prefix: u8) -> u32 {
+    // Shifting by the full width is undefined, so /0 is special-cased.
+    if prefix == 0 {
+        0
+    } else {
+        u32::from(a) & (!0u32 << (32 - prefix))
+    }
+}
+
+fn masked_v6(a: Ipv6Addr, prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::from(a) & (!0u128 << (128 - prefix))
+    }
 }

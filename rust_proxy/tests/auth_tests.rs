@@ -209,3 +209,111 @@ fn a_credential_in_the_body_is_not_a_credential() {
         AuthResult::Missing
     );
 }
+
+use rust_proxy::auth::{addr_allowed, Cidr};
+use std::net::IpAddr;
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().expect("test address must parse")
+}
+
+#[test]
+fn v4_prefix_matches_inside_and_rejects_outside() {
+    let net = Cidr::parse("192.168.1.0/24").unwrap();
+    assert!(net.contains(ip("192.168.1.1")));
+    assert!(net.contains(ip("192.168.1.255")));
+    assert!(!net.contains(ip("192.168.2.1")));
+}
+
+#[test]
+fn a_bare_v4_address_is_a_host_route() {
+    let host = Cidr::parse("10.0.0.7").unwrap();
+    assert!(host.contains(ip("10.0.0.7")));
+    assert!(!host.contains(ip("10.0.0.8")));
+}
+
+#[test]
+fn slash_zero_matches_every_address_of_its_family() {
+    let all4 = Cidr::parse("0.0.0.0/0").unwrap();
+    assert!(all4.contains(ip("8.8.8.8")));
+    assert!(all4.contains(ip("127.0.0.1")));
+    // Shifting by the full width is undefined in Rust; /0 must be special-cased.
+    assert!(!all4.contains(ip("2001:db8::1")));
+}
+
+#[test]
+fn v4_prefix_boundaries_are_exact() {
+    let net = Cidr::parse("10.1.2.0/23").unwrap();
+    assert!(net.contains(ip("10.1.2.0")));
+    assert!(net.contains(ip("10.1.3.255")));
+    assert!(!net.contains(ip("10.1.4.0")));
+    assert!(!net.contains(ip("10.1.1.255")));
+}
+
+#[test]
+fn v6_prefix_matches() {
+    let net = Cidr::parse("2001:db8::/32").unwrap();
+    assert!(net.contains(ip("2001:db8::1")));
+    assert!(net.contains(ip("2001:db8:ffff::1")));
+    assert!(!net.contains(ip("2001:db9::1")));
+    let host = Cidr::parse("::1").unwrap();
+    assert!(host.contains(ip("::1")));
+    assert!(!host.contains(ip("::2")));
+}
+
+#[test]
+fn families_do_not_cross_match() {
+    let net = Cidr::parse("192.168.1.0/24").unwrap();
+    assert!(!net.contains(ip("2001:db8::1")));
+}
+
+#[test]
+fn v4_mapped_v6_source_matches_a_v4_rule() {
+    // A v4 client arriving on a dual-stack listener appears as ::ffff:a.b.c.d.
+    // Without normalization a 192.168.1.0/24 rule would silently never match.
+    let net = Cidr::parse("192.168.1.0/24").unwrap();
+    assert!(net.contains(ip("::ffff:192.168.1.5")));
+    // And a rule written in mapped form must match a plain v4 source.
+    let mapped_rule = Cidr::parse("::ffff:192.168.1.0/24").unwrap();
+    assert!(mapped_rule.contains(ip("192.168.1.5")));
+}
+
+#[test]
+fn malformed_specs_are_rejected() {
+    for bad in [
+        "",
+        "not-an-ip",
+        "192.168.1.0/",
+        "192.168.1.0/abc",
+        "192.168.1.0/33",
+        "2001:db8::/129",
+        "192.168.1.0/-1",
+    ] {
+        assert!(Cidr::parse(bad).is_err(), "should reject {bad:?}");
+    }
+}
+
+#[test]
+fn surrounding_whitespace_in_a_spec_is_tolerated() {
+    assert!(Cidr::parse("  10.0.0.0/8  ")
+        .unwrap()
+        .contains(ip("10.1.1.1")));
+}
+
+#[test]
+fn an_empty_allowlist_permits_everything() {
+    // No --allow-from means no filtering, not deny-all.
+    assert!(addr_allowed(&[], ip("8.8.8.8")));
+    assert!(addr_allowed(&[], ip("2001:db8::1")));
+}
+
+#[test]
+fn a_populated_allowlist_is_a_union() {
+    let list = [
+        Cidr::parse("127.0.0.1").unwrap(),
+        Cidr::parse("10.0.0.0/8").unwrap(),
+    ];
+    assert!(addr_allowed(&list, ip("127.0.0.1")));
+    assert!(addr_allowed(&list, ip("10.9.9.9")));
+    assert!(!addr_allowed(&list, ip("192.168.1.1")));
+}
