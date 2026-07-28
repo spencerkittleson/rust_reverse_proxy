@@ -455,6 +455,19 @@ pub async fn handle_client(
     client_socket.set_nodelay(true)?;
 
     let client_addr = client_socket.peer_addr()?;
+
+    // Before the connection counters and before reading a single byte. Closing
+    // in silence is deliberate: an error page would confirm to a scanner that a
+    // proxy is listening here.
+    if !crate::auth::addr_allowed(&config.allow_from, client_addr.ip()) {
+        stats.acl_rejections.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "Refusing connection from {}: outside --allow-from",
+            client_addr
+        );
+        return Ok(());
+    }
+
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
     stats.active_connections.fetch_add(1, Ordering::Relaxed);
     debug!("Handling client connection from: {}", client_addr);
