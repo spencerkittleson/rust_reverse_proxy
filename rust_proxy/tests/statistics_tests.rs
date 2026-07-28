@@ -28,7 +28,7 @@ async fn test_statistics_integration_http() {
     // Start proxy with statistics
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3141", "--log-level", "error", "--allow-anonymous"])
-        .env_remove("RUST_PROXY_AUTH")
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -75,7 +75,7 @@ async fn test_statistics_integration_https() {
     // Start proxy with statistics
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3143", "--log-level", "error", "--allow-anonymous"])
-        .env_remove("RUST_PROXY_AUTH")
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -109,7 +109,7 @@ async fn test_statistics_error_tracking() {
     // Try to connect to a non-existent server to generate errors
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3144", "--log-level", "error", "--allow-anonymous"])
-        .env_remove("RUST_PROXY_AUTH")
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -181,7 +181,7 @@ async fn test_statistics_mixed_traffic() {
     // Start proxy with statistics
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3147", "--log-level", "error", "--allow-anonymous"])
-        .env_remove("RUST_PROXY_AUTH")
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -273,7 +273,7 @@ async fn test_statistics_concurrent_client_simulation() {
     // Start proxy
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3149", "--log-level", "error", "--allow-anonymous"])
-        .env_remove("RUST_PROXY_AUTH")
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
