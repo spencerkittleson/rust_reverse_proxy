@@ -283,3 +283,22 @@ async fn allow_anonymous_leaves_http_behavior_unchanged() {
     assert!(text.starts_with("GET /plain HTTP/1.1\r\n"), "{text:?}");
     assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test]
+async fn a_refused_request_with_a_body_still_receives_the_challenge() {
+    // Dropping the socket with the body still unread sends an RST that can
+    // discard the 407 we just wrote, so the client sees a connection reset
+    // instead of being told it needs to authenticate.
+    let (response, stats) = challenge_for(
+        "POST http://ORIGIN/submit HTTP/1.1\r\n\
+         Host: ORIGIN\r\n\
+         Content-Length: 11\r\n\
+         \r\n\
+         hello world",
+    )
+    .await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 407 "), "{text:?}");
+    assert!(text.contains("Proxy-Authenticate: Basic"), "{text:?}");
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
+}

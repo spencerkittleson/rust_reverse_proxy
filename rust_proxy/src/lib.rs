@@ -32,6 +32,12 @@ pub const STATS_FLUSH_THRESHOLD: u64 = 65536;
 /// likeliest source of spurious rewrite anomalies.
 pub const MAX_REQUEST_HEAD_SIZE: usize = 65536;
 
+/// Cap on the bytes drained from a client we are refusing, so the drain that
+/// prevents an RST from discarding our response cannot itself be turned into an
+/// unbounded read. We are not interested in the refused body, only in emptying
+/// the receive queue.
+pub const MAX_REFUSAL_DRAIN: usize = 65536;
+
 /// Client-facing challenge. `Connection: close` removes any question about
 /// stream state after a rejection; clients reconnect and retry, which is
 /// ordinary Basic behavior. No `Server` and no `Date`, matching the 502s.
@@ -579,6 +585,33 @@ async fn connect_and_tunnel(
     }
 }
 
+/// Send a final response to the client and close cleanly.
+///
+/// Dropping a socket that still has unread bytes in its receive queue makes
+/// Linux send an RST, which can discard the response we just wrote — so a
+/// refused request that carried a body would surface to the client as a
+/// connection reset instead of the status we sent. Shutting down the write half
+/// gives the client a FIN so it knows the response is complete, and draining
+/// what it already sent leaves nothing to reset over.
+///
+/// The drain is bounded in both bytes (`MAX_REFUSAL_DRAIN`) and time
+/// (`CONNECT_TIMEOUT`): a client we are refusing must not be able to make us
+/// read indefinitely.
+async fn refuse_with(mut client_socket: TcpStream, response: &[u8]) -> Result<(), ProxyError> {
+    client_socket.write_all(response).await?;
+    let _ = client_socket.shutdown().await;
+
+    let mut scratch = [0u8; 1024];
+    let mut drained = 0usize;
+    while drained < MAX_REFUSAL_DRAIN {
+        match timeout(CONNECT_TIMEOUT, client_socket.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
+    Ok(())
+}
+
 async fn handle_http(
     mut client_socket: TcpStream,
     stats: Arc<ProxyStats>,
@@ -627,8 +660,7 @@ async fn handle_http(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             warn!("Refusing request from {}: {}", peer, outcome.reason());
-            client_socket.write_all(PROXY_AUTH_REQUIRED).await?;
-            return Ok(());
+            return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
         }
     }
 
