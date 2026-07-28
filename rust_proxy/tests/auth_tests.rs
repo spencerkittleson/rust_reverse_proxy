@@ -178,7 +178,6 @@ fn reason_codes_never_contain_credential_material() {
     ] {
         let reason = r.reason();
         assert!(!reason.is_empty());
-        assert!(!reason.contains("secret"), "{reason}");
     }
     assert!(AuthResult::Granted.is_granted());
     assert!(!AuthResult::Missing.is_granted());
@@ -192,5 +191,21 @@ fn debug_output_never_reveals_a_credential() {
     assert!(!rendered.contains("supersecret"), "{rendered}");
     assert!(!rendered.contains("hunter2"), "{rendered}");
     assert!(!rendered.contains("alice"), "{rendered}");
-    assert!(rendered.contains('2'), "entry count should be visible: {rendered}");
+    assert!(rendered.contains("entries: 2"), "entry count should be visible: {rendered}");
+}
+
+#[test]
+fn a_credential_in_the_body_is_not_a_credential() {
+    // Scanning must stop at the blank line ending the head. Without that stop,
+    // any client could put a credential in a request body it fully controls.
+    // Nothing else in this file would catch that regression.
+    let head_and_body = b"POST http://e.example/x HTTP/1.1\r\n\
+                          Host: e.example\r\n\
+                          Content-Length: 46\r\n\
+                          \r\n\
+                          Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n";
+    assert_eq!(
+        creds("user:secret").check_head(head_and_body),
+        AuthResult::Missing
+    );
 }

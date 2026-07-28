@@ -116,6 +116,10 @@ impl Credentials {
         self.joined.len()
     }
 
+    /// Structurally always `false`: `parse_file_contents` rejects a file that
+    /// parses to zero entries. This exists to satisfy `len_without_is_empty`,
+    /// not to answer "is authentication disabled" — that question is answered
+    /// by `Option<Credentials>` being `None`.
     pub fn is_empty(&self) -> bool {
         self.joined.is_empty()
     }
