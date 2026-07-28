@@ -286,6 +286,46 @@ async fn test_socks5_connect_domain() {
     let _ = proxy_child.wait();
 }
 
+/// Spawns a subprocess and waits for it to exit within a bounded time,
+/// then collects its output. Unlike `Command::output()`, this cannot block
+/// forever: the three startup-gate tests below pin a fail-closed security
+/// gate that is supposed to make the process exit(2) before the listener
+/// ever binds. If that gate ever regressed into binding a port and running
+/// forever, `.output()` would hang the whole suite waiting on a process
+/// that will never terminate. Polling `try_wait()` for up to
+/// `Duration::from_secs(2)` (the same startup-wait duration used elsewhere
+/// in this file) turns that hang into a clear, bounded test failure instead.
+fn spawn_and_wait_bounded(command: &mut Command) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to run proxy binary");
+
+    let mut exited = false;
+    for _ in 0..20 {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "startup gate regressed: process was still running after {:?} \
+             (expected an immediate exit(2)); killed it to avoid hanging the suite",
+            Duration::from_secs(2)
+        );
+    }
+
+    child
+        .wait_with_output()
+        .expect("failed to collect subprocess output")
+}
+
 /// Regression: catches a refactor that drops the startup credential gate
 /// entirely, letting the proxy come up wide open when the operator supplied
 /// neither a credential nor an explicit --allow-anonymous opt-out. The gate
@@ -295,11 +335,10 @@ async fn test_socks5_connect_domain() {
 /// for the wrong reason.
 #[test]
 fn test_missing_credential_exits_two() {
-    let output = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
-        .env_remove(rust_proxy::AUTH_ENV_VAR)
-        .output()
-        .expect("Failed to run proxy binary");
+    let mut cmd = Command::new("cargo");
+    cmd.args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR);
+    let output = spawn_and_wait_bounded(&mut cmd);
 
     assert_eq!(
         output.status.code(),
@@ -322,11 +361,10 @@ fn test_missing_credential_exits_two() {
 /// "no credentials found".
 #[test]
 fn test_whitespace_only_auth_env_is_no_credential() {
-    let output = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
-        .env(rust_proxy::AUTH_ENV_VAR, "   ")
-        .output()
-        .expect("Failed to run proxy binary");
+    let mut cmd = Command::new("cargo");
+    cmd.args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
+        .env(rust_proxy::AUTH_ENV_VAR, "   ");
+    let output = spawn_and_wait_bounded(&mut cmd);
 
     assert_eq!(
         output.status.code(),
@@ -346,19 +384,18 @@ fn test_whitespace_only_auth_env_is_no_credential() {
 /// credential, which would disable authentication the operator asked for).
 #[test]
 fn test_credential_plus_allow_anonymous_exits_two() {
-    let output = Command::new("cargo")
-        .args(&[
-            "run",
-            "--",
-            "--host",
-            "127.0.0.1",
-            "--log-level",
-            "error",
-            "--allow-anonymous",
-        ])
-        .env(rust_proxy::AUTH_ENV_VAR, "user:secret")
-        .output()
-        .expect("Failed to run proxy binary");
+    let mut cmd = Command::new("cargo");
+    cmd.args(&[
+        "run",
+        "--",
+        "--host",
+        "127.0.0.1",
+        "--log-level",
+        "error",
+        "--allow-anonymous",
+    ])
+    .env(rust_proxy::AUTH_ENV_VAR, "user:secret");
+    let output = spawn_and_wait_bounded(&mut cmd);
 
     assert_eq!(
         output.status.code(),
