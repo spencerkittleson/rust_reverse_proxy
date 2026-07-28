@@ -790,10 +790,9 @@ async fn handle_socks5(
         let mut ver_ulen = [0u8; 2];
         timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut ver_ulen)).await??;
         if ver_ulen[0] != 0x01 {
-            client_socket.write_all(&[0x01, 0x01]).await?;
             stats.auth_failures.fetch_add(1, Ordering::Relaxed);
             warn!("SOCKS5 username/password sub-negotiation had a bad version");
-            return Ok(());
+            return refuse_with(client_socket, &[0x01, 0x01]).await;
         }
 
         let mut uname = vec![0u8; ver_ulen[1] as usize];
@@ -814,8 +813,7 @@ async fn handle_socks5(
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "unknown".to_string()));
-            client_socket.write_all(&[0x01, 0x01]).await?;
-            return Ok(());
+            return refuse_with(client_socket, &[0x01, 0x01]).await;
         }
         client_socket.write_all(&[0x01, 0x00]).await?;
     }
