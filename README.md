@@ -54,6 +54,10 @@ with another.
   behind a NAT," which describes billions of connections.
 - **Anything from your own client.** Error responses the proxy returns are seen
   only by the local client, which already knows the proxy exists.
+- **Your proxy credential, if anyone can watch the client-to-proxy path.** HTTP
+  Basic and SOCKS5 RFC 1929 are cleartext and this proxy has no TLS library.
+  This is a different path than the rest of this section (client↔proxy, not
+  proxy↔origin) — see [Authentication](#authentication).
 
 ### `--rewrite-fallback`
 
@@ -88,6 +92,11 @@ Problems are itemized by reason, with the last host that triggered each:
 ```
 
 ## Quick Start
+
+**Every command on this page omits authentication flags for brevity.** The
+proxy will not start without either a credential or an explicit
+`--allow-anonymous` — see [Authentication](#authentication) before running any
+example below as literally shown.
 
 ### Option 1: Download Pre-built Binary (Recommended)
 
@@ -132,6 +141,10 @@ cargo build --release
 - `--rewrite-fallback`: Forward requests verbatim when rewriting fails, instead
   of closing the connection. Leaks proxy presence to the origin for each
   affected request. Off by default (see [Proxy visibility](#proxy-visibility)).
+- `--auth-file <PATH>`: Credentials file (see [Authentication](#authentication)).
+- `--allow-anonymous`: Run with no credential — an open relay, on purpose.
+- `--allow-from <CIDR>`: Only accept connections from this address or range.
+  Repeatable.
 
 ### Logging
 
@@ -216,19 +229,25 @@ curl -x http://127.0.0.1:3129 https://example.com
 
 The proxy auto-detects the protocol from the first byte of each connection, so
 the same listening port serves both HTTP/HTTPS clients and SOCKS5 clients. Only
-SOCKS5 with no authentication and the `CONNECT` command is supported (no SOCKS4,
-no UDP ASSOCIATE, no BIND, no username/password auth). IPv4, IPv6, and
-domain-name destination addresses (ATYP 0x01, 0x03, 0x04) are all supported.
+the `CONNECT` command is supported (no SOCKS4, no UDP ASSOCIATE, no BIND).
+Authentication follows the same policy as HTTP: RFC 1929 username/password when
+a credential is configured, no authentication under `--allow-anonymous`. IPv4,
+IPv6, and domain-name destination addresses (ATYP 0x01, 0x03, 0x04) are all
+supported.
 
 ```bash
-# Start proxy
-./target/release/rust_proxy --port 3129
+# Start proxy (anonymous — see Authentication)
+./target/release/rust_proxy --port 3129 --allow-anonymous
 
 # curl over SOCKS5 (resolve hostname locally)
 curl --socks5 127.0.0.1:3129 https://example.com
 
 # curl over SOCKS5 (let the proxy resolve the hostname — ATYP=domain)
 curl --socks5-hostname 127.0.0.1:3129 https://example.com
+
+# Start proxy with a credential instead, and authenticate via RFC 1929
+./target/release/rust_proxy --port 3129 --auth-file /tmp/auth
+curl --socks5 spencer:somepassword@127.0.0.1:3129 https://example.com
 ```
 
 #### Tunneling SSH through the proxy
@@ -246,6 +265,66 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:3129 %h %p' user@target-host
 ```
 
 `nc -X 5` (OpenBSD netcat) speaks SOCKS5 to the proxy; `ncat --proxy 127.0.0.1:3129 --proxy-type socks5` works equivalently. `ServerAliveInterval` is recommended to keep idle shells alive — although the proxy allows 5 minutes of idle, network middleboxes between you and the target may be stricter.
+
+## Authentication
+
+**The proxy will not start** without either a credential or an explicit
+`--allow-anonymous`. There is no implicit open-relay default — forwarding for
+anyone who can reach the port is a choice the operator has to make on purpose,
+and an invalid or missing configuration exits with status 2 before the
+listener binds.
+
+| Flag / variable | Meaning |
+| --- | --- |
+| `--auth-file <PATH>` | Credentials file: one `user:password` per line, `#` comments and blank lines skipped, split on the first colon so passwords may contain colons, a trailing `\r` is stripped so a file edited on Windows works. Takes precedence over `RUST_PROXY_AUTH` (with a warning if both are set). |
+| `RUST_PROXY_AUTH` | Same grammar as `--auth-file`'s contents, not a single credential — newline-separated `user:password` entries and `#` comments are accepted here too. Typically used for one inline credential where a file is awkward (e.g. a launcher's environment block), but it is not limited to one. |
+| `--allow-anonymous` | Run with no credential. Open relay — refuses to combine with a configured credential. |
+| `--allow-from <CIDR>` | Only accept connections from this address or range. Repeatable. Checked first, before a byte is read and before any credential check — but it is a network-position control, not a substitute for one. |
+
+HTTP and CONNECT clients authenticate with `Proxy-Authorization: Basic`, which
+is what `http://user:password@host:3129` in `HTTP_PROXY`/`HTTPS_PROXY`
+produces. The credential is re-checked on every request head, not just the
+first — including request 2..n on a reused keep-alive connection — so it
+cannot be presented once and reused silently for the rest of the connection.
+SOCKS5 clients authenticate with RFC 1929 username/password during method
+negotiation; with a credential configured, the no-auth method (`0x00`) is
+never offered, so SOCKS5 cannot be used as a bypass around the HTTP gate on
+the same port.
+
+### These credentials are not confidential in transit
+
+This proxy contains no TLS library, by design. HTTP Basic and SOCKS5 RFC 1929
+both send the credential in cleartext, so anyone who can observe the path
+between your client and the proxy can read it and replay it. Authentication
+here stops an unauthorized party from *using* the proxy; it does not protect
+the credential itself.
+
+Do not expose the port to the internet. If the proxy is not on the same host
+as its clients, put it behind a tunnel — WireGuard on OpenWrt is the intended
+pattern — and treat `--allow-from` and the credential as defense in depth
+behind that tunnel, not as a substitute for one. Brute-force protection is the
+firewall's job, not this proxy's.
+
+### `--rewrite-fallback` narrows this slightly
+
+`--rewrite-fallback` (see [Proxy visibility](#proxy-visibility)) can accept a
+fallback-eligible rewrite anomaly on an *already-authenticated* connection by
+latching it into an unrewritten passthrough for the rest of that connection's
+lifetime, which stops re-checking the credential on it. This is not a way to
+skip the initial authentication — it requires the opt-in flag, a connection
+that has already presented a valid credential, and an origin host:port that
+was fixed when the tunnel was set up. It is the same "one leak per connection,
+never a desynchronized stream" trade the flag already makes for rewriting,
+extended to cover this one edge case rather than closing the connection over
+it.
+
+### Deployment notes
+
+Windows VM: keep the credentials file on the shared folder the guest sees as
+`G:\`, and launch with `--auth-file G:\rust_proxy_auth`.
+
+OpenWrt: `/etc/rust_proxy/auth`, mode 600, root-owned, referenced from a procd
+init script. Building and packaging for OpenWrt is not covered here.
 
 ## Testing
 

@@ -7,7 +7,8 @@ Guidance for coding agents working in this repository.
 Despite the repo name, this is a **forward proxy**, not a reverse proxy. It
 listens on one port and auto-detects the protocol from the first byte:
 
-- `0x05` → SOCKS5 (RFC 1928, no-auth, CONNECT only)
+- `0x05` → SOCKS5 (RFC 1928, CONNECT only; RFC 1929 username/password required
+  unless `--allow-anonymous`)
 - anything else → HTTP (absolute-form requests, or `CONNECT` for HTTPS)
 
 It is a **pure TCP relay with no TLS library at all** — no `rustls`, no
@@ -76,6 +77,47 @@ dropping it would make the `Upgrade`/`101` passthrough unreachable.
   because non-default keepalive/user-timeout values are observable from the
   origin side. In `tunnel_fast`, `src` is the client and `dst` is the origin.
 - **SOCKS5 and CONNECT stay blind relays.** No rewriting, no parsing.
+
+## Authentication is enforced in three places
+
+Auth is checked at each protocol's natural granularity. If you add a code path
+that forwards bytes, confirm it passes one of these:
+
+1. `handle_http` — after the head is read, **before any origin dial**. Covers
+   CONNECT and the first plain-HTTP request, and is the only site that can
+   still write a 407. Checking later would let an unauthenticated client make
+   the proxy open arbitrary outbound connections.
+2. `RequestStream::handle_head` — every head, so requests 2..n on a reused
+   keep-alive connection are re-checked. A one-shot check at connection setup
+   is the same class of bug as a one-shot rewrite: it leaks on the common case.
+3. `handle_socks5` — RFC 1929. With a credential configured, method `0x00` is
+   never offered, or SOCKS5 becomes a bypass around the HTTP gate on the same
+   port.
+
+`--allow-from` is checked earliest of all, in `handle_client`, before a byte is
+read and before the connection counters — but it is a source-address filter,
+not a credential check, and is not a substitute for one.
+
+**`PushError::Unauthorized` must never route through `on_anomaly`.** That is
+where `--rewrite-fallback` decides to forward verbatim. The flag buys a
+rewrite leak; it must never buy an access-control bypass. There is a test
+asserting rejection under both policies — if you touch the error plumbing,
+that is the one that matters. The one narrow, accepted exception is the
+reverse direction: once a connection has already authenticated and
+`--rewrite-fallback` later latches it into `State::Passthrough` for an
+unrelated rewrite anomaly, that passthrough state stops re-checking the
+credential for the rest of the connection (see the `auth` field doc on
+`RequestStream` in `http_rewrite.rs`). That is documented, requires the opt-in
+flag plus a connection that already authenticated, and never lets an
+unauthenticated request through — treat it as settled unless the review
+record says otherwise.
+
+Auth is mandatory: startup fails (exit status 2) without either a credential
+or `--allow-anonymous`. Every subprocess test therefore passes
+`--allow-anonymous`.
+
+Never log any part of a credential, including the username. `AuthResult::reason`
+exists to give the log a fixed, credential-free string.
 
 ## Explicit non-goals
 
