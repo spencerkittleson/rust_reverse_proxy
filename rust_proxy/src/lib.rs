@@ -14,6 +14,7 @@ pub use url::Url;
 pub mod windows;
 
 pub mod http_rewrite;
+pub mod auth;
 
 use crate::http_rewrite::RewriteAnomaly;
 
