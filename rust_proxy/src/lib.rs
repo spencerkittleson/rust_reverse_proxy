@@ -759,8 +759,6 @@ async fn handle_socks5(
     stats: Arc<ProxyStats>,
     config: Arc<RuntimeConfig>,
 ) -> Result<(), ProxyError> {
-    // Unused until the RFC 1929 handshake lands; keeps the migration warning-free.
-    let _ = &config;
     // --- Method negotiation ---
     // Client: VER | NMETHODS | METHODS...
     let mut header = [0u8; 2];
@@ -774,14 +772,53 @@ async fn handle_socks5(
         timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut methods)).await??;
     }
 
-    // We only support "no authentication" (0x00).
-    if !methods.contains(&0x00) {
+    // With a credential configured, "no authentication" is never offered: a
+    // SOCKS5 client that could still pick 0x00 would be a bypass around the
+    // HTTP gate on the same port.
+    let selected: u8 = if config.auth.is_some() { 0x02 } else { 0x00 };
+    if !methods.contains(&selected) {
         // 0xFF = NO ACCEPTABLE METHODS
         client_socket.write_all(&[0x05, 0xFF]).await?;
         warn!("SOCKS5 client offered no acceptable auth methods");
         return Ok(());
     }
-    client_socket.write_all(&[0x05, 0x00]).await?;
+    client_socket.write_all(&[0x05, selected]).await?;
+
+    if let Some(creds) = config.auth.as_deref() {
+        // RFC 1929: VER(0x01) | ULEN | UNAME | PLEN | PASSWD.
+        // Note VER is 0x01 here, not 0x05.
+        let mut ver_ulen = [0u8; 2];
+        timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut ver_ulen)).await??;
+        if ver_ulen[0] != 0x01 {
+            client_socket.write_all(&[0x01, 0x01]).await?;
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            warn!("SOCKS5 username/password sub-negotiation had a bad version");
+            return Ok(());
+        }
+
+        let mut uname = vec![0u8; ver_ulen[1] as usize];
+        if !uname.is_empty() {
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut uname)).await??;
+        }
+        let mut plen = [0u8; 1];
+        timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut plen)).await??;
+        let mut passwd = vec![0u8; plen[0] as usize];
+        if !passwd.is_empty() {
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut passwd)).await??;
+        }
+
+        if !creds.verify_pair(&uname, &passwd) {
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            // No username in the log: a client may have put its password there.
+            warn!("SOCKS5 authentication failed for {}", client_socket
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_string()));
+            client_socket.write_all(&[0x01, 0x01]).await?;
+            return Ok(());
+        }
+        client_socket.write_all(&[0x01, 0x00]).await?;
+    }
 
     // --- Request ---
     // VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
