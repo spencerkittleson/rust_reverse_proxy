@@ -399,12 +399,23 @@ fn test_valid_auth_env_starts_proxy() {
 
     thread::sleep(Duration::from_secs(2));
 
+    // try_wait() observes the cargo process, not the proxy: if cargo is still
+    // compiling or blocked on the build lock at this point, the child is alive
+    // and the test would pass without a proxy ever having started. Connecting
+    // proves the listener actually bound.
+    let connected = std::net::TcpStream::connect("127.0.0.1:3170").is_ok();
+
     let exited = child.try_wait().expect("try_wait failed");
     let still_running = exited.is_none();
 
     let _ = child.kill();
     let _ = child.wait();
 
+    assert!(
+        connected,
+        "a valid {} alone must start the proxy, but nothing accepted a connection on 127.0.0.1:3170",
+        rust_proxy::AUTH_ENV_VAR
+    );
     assert!(
         still_running,
         "a valid {} alone must start the proxy, but it exited: {:?}",
