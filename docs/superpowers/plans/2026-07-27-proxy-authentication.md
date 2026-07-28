@@ -1661,25 +1661,27 @@ async fn an_authenticated_request_reaches_the_origin_without_the_credential() {
     assert_eq!(stats.requests_sanitized.load(Ordering::Relaxed), 1);
 }
 
-#[tokio::test]
-async fn an_unauthenticated_client_is_told_how_to_authenticate() {
-    // A bare close would leave a client guessing. The 407 must name the scheme
-    // and must not carry Server or Date.
+/// Send `request` (with `ORIGIN` replaced by a listener that never accepts) to
+/// an authenticating proxy and return the client-visible response bytes plus
+/// the proxy's stats. Used by the tests that need to inspect the 407 itself,
+/// which `proxy_roundtrip_with` cannot show because it reports origin bytes.
+async fn challenge_for(request_template: &str) -> (Vec<u8>, Arc<ProxyStats>) {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
 
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let stats = Arc::new(ProxyStats::new());
+    let stats_for_proxy = stats.clone();
     let config = auth_config("user:secret");
     tokio::spawn(async move {
         let (socket, _) = proxy.accept().await.unwrap();
-        let _ = handle_client(socket, stats, config).await;
+        let _ = handle_client(socket, stats_for_proxy, config).await;
     });
 
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    let request = format!("GET http://{origin_addr}/x HTTP/1.1\r\nHost: {origin_addr}\r\n\r\n");
-    client.write_all(request.as_bytes()).await.unwrap();
+    let wire = request_template.replace("ORIGIN", &origin_addr.to_string());
+    client.write_all(wire.as_bytes()).await.unwrap();
 
     let mut response = Vec::new();
     let _ = tokio::time::timeout(
@@ -1687,50 +1689,35 @@ async fn an_unauthenticated_client_is_told_how_to_authenticate() {
         client.read_to_end(&mut response),
     )
     .await;
+    drop(origin);
+    (response, stats)
+}
 
+#[tokio::test]
+async fn an_unauthenticated_client_is_told_how_to_authenticate() {
+    // A bare close would leave a client guessing. The 407 must name the scheme
+    // and must not carry Server or Date.
+    let (response, _stats) =
+        challenge_for("GET http://ORIGIN/x HTTP/1.1\r\nHost: ORIGIN\r\n\r\n").await;
     let text = String::from_utf8_lossy(&response);
     assert!(text.starts_with("HTTP/1.1 407 "), "{text:?}");
     assert!(text.contains("Proxy-Authenticate: Basic"), "{text:?}");
     let lowered = text.to_lowercase();
     assert!(!lowered.contains("\r\nserver:"), "{text:?}");
     assert!(!lowered.contains("\r\ndate:"), "{text:?}");
-    drop(origin);
 }
 
 #[tokio::test]
 async fn unauthenticated_connect_is_refused_before_the_tunnel_opens() {
-    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_addr = origin.local_addr().unwrap();
-
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy.local_addr().unwrap();
-    let stats = Arc::new(ProxyStats::new());
-    let stats_check = stats.clone();
-    let config = auth_config("user:secret");
-    tokio::spawn(async move {
-        let (socket, _) = proxy.accept().await.unwrap();
-        let _ = handle_client(socket, stats, config).await;
-    });
-
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    let request = format!("CONNECT {origin_addr} HTTP/1.1\r\nHost: {origin_addr}\r\n\r\n");
-    client.write_all(request.as_bytes()).await.unwrap();
-
-    let mut response = Vec::new();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.read_to_end(&mut response),
-    )
-    .await;
-
+    let (response, stats) =
+        challenge_for("CONNECT ORIGIN HTTP/1.1\r\nHost: ORIGIN\r\n\r\n").await;
     let text = String::from_utf8_lossy(&response);
     assert!(text.starts_with("HTTP/1.1 407 "), "{text:?}");
     assert!(
         !text.contains("200 Connection Established"),
         "a tunnel was acknowledged to an unauthenticated client: {text:?}"
     );
-    assert_eq!(stats_check.auth_failures.load(Ordering::Relaxed), 1);
-    drop(origin);
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -2611,11 +2598,25 @@ The test of the goal. If a credential changes what the origin sees, the whole fe
 
 - [ ] **Step 1: Write the failing test**
 
-In `rust_proxy/tests/golden_equality_tests.rs`, add an authenticating variant of `proxied_bytes` next to the existing one:
+In `rust_proxy/tests/golden_equality_tests.rs`, refactor the existing `proxied_bytes` into a delegating pair so the authenticated variant shares its body rather than duplicating it. Replace the whole `proxied_bytes` function with:
 
 ```rust
-/// Bytes the origin sees when the request goes through an authenticating proxy.
-async fn proxied_bytes_authenticated(request: &str, origin_placeholder: &str) -> Vec<u8> {
+/// Bytes the origin sees when the same request goes through the proxy.
+async fn proxied_bytes(request: &str, origin_placeholder: &str) -> Vec<u8> {
+    proxied_bytes_with(
+        request,
+        origin_placeholder,
+        Arc::new(RuntimeConfig::anonymous(RewritePolicy::FailClosed)),
+    )
+    .await
+}
+
+/// Same, with an explicit runtime configuration.
+async fn proxied_bytes_with(
+    request: &str,
+    origin_placeholder: &str,
+    config: Arc<RuntimeConfig>,
+) -> Vec<u8> {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
     let task = tokio::spawn(record_one(origin));
@@ -2625,13 +2626,6 @@ async fn proxied_bytes_authenticated(request: &str, origin_placeholder: &str) ->
     let stats = Arc::new(ProxyStats::new());
     tokio::spawn(async move {
         let (socket, _) = proxy.accept().await.unwrap();
-        let config = Arc::new(RuntimeConfig {
-            policy: RewritePolicy::FailClosed,
-            auth: Some(Arc::new(
-                rust_proxy::auth::Credentials::parse_file_contents("user:secret").unwrap(),
-            )),
-            allow_from: Vec::new(),
-        });
         let _ = handle_client(socket, stats, config).await;
     });
 
@@ -2648,7 +2642,20 @@ async fn proxied_bytes_authenticated(request: &str, origin_placeholder: &str) ->
     drop(client);
     task.await.unwrap()
 }
+
+/// A runtime configuration requiring `user:secret`.
+fn authenticating_config() -> Arc<RuntimeConfig> {
+    Arc::new(RuntimeConfig {
+        policy: RewritePolicy::FailClosed,
+        auth: Some(Arc::new(
+            rust_proxy::auth::Credentials::parse_file_contents("user:secret").unwrap(),
+        )),
+        allow_from: Vec::new(),
+    })
+}
 ```
+
+This supersedes the `RuntimeConfig::anonymous` inline change made to `proxied_bytes` in Task 4 — that call now lives in the delegating wrapper.
 
 Then append the test:
 
@@ -2663,7 +2670,7 @@ async fn an_authenticated_request_is_indistinguishable_from_direct() {
     let proxied = "GET http://ORIGIN/path?q=1 HTTP/1.1\r\nHost: ORIGIN\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\nProxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n";
 
     let from_direct = direct_bytes(direct, "ORIGIN").await;
-    let from_proxy = proxied_bytes_authenticated(proxied, "ORIGIN").await;
+    let from_proxy = proxied_bytes_with(proxied, "ORIGIN", authenticating_config()).await;
 
     // Byte-exact after normalizing only the origin's own address, which
     // legitimately differs between the two listeners.
