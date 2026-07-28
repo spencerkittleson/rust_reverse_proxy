@@ -505,6 +505,9 @@ fn auth_counters_start_at_zero_and_increment() {
     assert_eq!(stats.acl_rejections.load(Ordering::Relaxed), 3);
     assert!(stats.allow_anonymous_active.load(Ordering::Relaxed));
 
-    // log_stats must not panic with the new fields populated.
+    // Exercises the new report branches. This asserts nothing: a format-argument
+    // mismatch is a compile error in Rust, not a panic, so the only thing this
+    // could catch is a future `unwrap()` introduced into log_stats. A real
+    // assertion on the emitted text would need a log-capture harness.
     stats.log_stats();
 }

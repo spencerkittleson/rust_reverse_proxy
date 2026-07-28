@@ -95,9 +95,9 @@ async fn main() -> Result<(), ProxyError> {
 
     stats.set_anonymous_active(config.auth.is_none());
     if config.auth.is_none() {
-        warn!("--allow-anonymous is enabled: any client that can reach {} may relay", addr);
+        warn!("No credential is configured: any client that can reach {} may relay through this proxy.", addr);
         if config.allow_from.is_empty() {
-            warn!("and no --allow-from restriction is set, so that is every reachable host.");
+            warn!("No --allow-from restriction is set either, so that is every host that can reach it.");
         }
     }
     

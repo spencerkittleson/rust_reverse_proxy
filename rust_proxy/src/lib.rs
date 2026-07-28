@@ -57,7 +57,7 @@ pub struct ProxyStats {
     pub auth_failures: AtomicU64,
     /// Connections refused because the source address is outside --allow-from.
     pub acl_rejections: AtomicU64,
-    /// Whether `--allow-anonymous` is enabled, for the report banner.
+    /// Whether no credential is configured, for the report banner.
     pub allow_anonymous_active: AtomicBool,
     pub start_time: Instant,
 }
@@ -161,21 +161,6 @@ impl ProxyStats {
             );
         }
 
-        // Only non-zero access-control counters print, so a clean run stays quiet.
-        let auth_failures = self.auth_failures.load(Ordering::Relaxed);
-        if auth_failures > 0 {
-            info!("   Auth Failures: {}", auth_failures);
-        }
-        let acl_rejections = self.acl_rejections.load(Ordering::Relaxed);
-        if acl_rejections > 0 {
-            info!("   Source Rejections: {}", acl_rejections);
-        }
-        if self.allow_anonymous_active.load(Ordering::Relaxed) {
-            warn!(
-                "      ⚠ --allow-anonymous ACTIVE — this proxy relays for unauthenticated clients"
-            );
-        }
-
         // Only non-zero reasons print, so a clean run stays one line.
         for anomaly in RewriteAnomaly::ALL {
             let count = self.rewrite_anomalies[anomaly.index()].load(Ordering::Relaxed);
@@ -186,6 +171,21 @@ impl ProxyStats {
                 Some(host) => info!("      {}: {} (last: {})", anomaly.name(), count, host),
                 None => info!("      {}: {}", anomaly.name(), count),
             }
+        }
+
+        // Only non-zero access-control counters print, so a clean run stays quiet.
+        let auth_failures = self.auth_failures.load(Ordering::Relaxed);
+        if auth_failures > 0 {
+            info!("   Auth Failures: {} requests", auth_failures);
+        }
+        let acl_rejections = self.acl_rejections.load(Ordering::Relaxed);
+        if acl_rejections > 0 {
+            info!("   Source Rejections: {} connections", acl_rejections);
+        }
+        if self.allow_anonymous_active.load(Ordering::Relaxed) {
+            warn!(
+                "      ⚠ NO CREDENTIAL CONFIGURED — this proxy relays for unauthenticated clients"
+            );
         }
     }
 }
