@@ -561,7 +561,6 @@ async fn connect_and_tunnel(
                         // Nothing has gone upstream yet, so the client can still
                         // be told. Mid-stream failures cannot be, which is why
                         // the relay path just closes.
-                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
                         match err {
                             crate::http_rewrite::PushError::Unauthorized => {
                                 // Reachable: `handle_http` gates only the first
@@ -575,6 +574,7 @@ async fn connect_and_tunnel(
                                 return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
                             }
                             crate::http_rewrite::PushError::Anomaly(anomaly) => {
+                                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     "Rewrite anomaly '{}' on first request to {}:{} — refusing",
                                     anomaly.name(),
