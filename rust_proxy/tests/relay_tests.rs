@@ -325,3 +325,26 @@ async fn a_later_request_without_the_credential_never_reaches_the_origin() {
         "the second request was not recorded as an auth failure"
     );
 }
+
+#[tokio::test]
+async fn both_authenticated_pipelined_requests_reach_the_origin() {
+    // The false-reject control for
+    // `a_later_request_without_the_credential_never_reaches_the_origin`: that
+    // test's assertions also pass if the per-head check refuses everything, so
+    // this one proves a valid credential on head 2 is still honored.
+    let request = b"GET http://ORIGIN/one HTTP/1.1\r\nHost: ORIGIN\r\n\
+                    Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n\
+                    GET http://ORIGIN/two HTTP/1.1\r\nHost: ORIGIN\r\n\
+                    Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n";
+    let (received, stats) = proxy_roundtrip_with(request, auth_config("user:secret")).await;
+
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.contains("GET /one HTTP/1.1"), "{text:?}");
+    assert!(text.contains("GET /two HTTP/1.1"), "{text:?}");
+    assert!(
+        !text.to_lowercase().contains("proxy-authorization"),
+        "credential leaked upstream: {text:?}"
+    );
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 0);
+}
+

@@ -507,7 +507,13 @@ pub struct RequestStream {
     pending: Vec<u8>,
     max_head: usize,
     policy: RewritePolicy,
-    /// `None` means `--allow-anonymous`; then no head is ever checked.
+    /// `None` means `--allow-anonymous`: no head is checked at all.
+    ///
+    /// Note that `State::Passthrough` also stops checking — `push` returns
+    /// before parsing once the stream latches it. That happens on the
+    /// `Upgrade`/101 path and when a fallback-eligible anomaly fires under
+    /// `--rewrite-fallback`. Both require an already-authenticated connection
+    /// with a fixed origin, which is why it is accepted rather than closed.
     auth: Option<Arc<Credentials>>,
     anomalies: Vec<RewriteAnomaly>,
     /// Cumulative, for tests and diagnostics.

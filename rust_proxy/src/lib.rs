@@ -551,9 +551,12 @@ async fn connect_and_tunnel(
                         stats.connection_errors.fetch_add(1, Ordering::Relaxed);
                         match err {
                             crate::http_rewrite::PushError::Unauthorized => {
-                                // Unreachable in practice: `handle_http` already
-                                // gated this head. Answering correctly anyway
-                                // beats an `unreachable!` in a security path.
+                                // Reachable: `handle_http` gates only the first
+                                // head of the buffer it read, so a pipelined
+                                // second head arrives here unchecked. Nothing
+                                // has gone upstream yet — `remote.write_all` is
+                                // below — so this is both correct and the last
+                                // chance to say it.
                                 stats.auth_failures.fetch_add(1, Ordering::Relaxed);
                                 warn!("Unauthenticated request to {}:{} — refusing", host, port);
                                 return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
