@@ -405,7 +405,7 @@ fn analyze_ssl_error(host: &str, port: u16, error: &std::io::Error) {
 pub async fn handle_client(
     client_socket: TcpStream,
     stats: Arc<ProxyStats>,
-    policy: crate::http_rewrite::RewritePolicy,
+    config: Arc<RuntimeConfig>,
 ) -> Result<(), ProxyError> {
     // Configure socket options for better performance
     client_socket.set_nodelay(true)?;
@@ -424,10 +424,10 @@ pub async fn handle_client(
     }
 
     let result = if peek_buf[0] == 0x05 {
-        // SOCKS5 is a blind byte relay: nothing to rewrite.
-        handle_socks5(client_socket, stats.clone()).await
+        // SOCKS5 is a blind byte relay after the handshake: nothing to rewrite.
+        handle_socks5(client_socket, stats.clone(), config).await
     } else {
-        handle_http(client_socket, stats.clone(), policy).await
+        handle_http(client_socket, stats.clone(), config).await
     };
 
     // Cleanup: decrement active connections counter
@@ -463,7 +463,7 @@ pub enum Upstream {
     /// Plain HTTP: rewrite this head, then every later head on the connection.
     Http {
         first_head: Vec<u8>,
-        policy: crate::http_rewrite::RewritePolicy,
+        config: Arc<RuntimeConfig>,
     },
 }
 
@@ -486,17 +486,17 @@ async fn connect_and_tunnel(
                         .await?;
                     tunnel_fast(client_socket, remote, None, host, stats).await
                 }
-                Upstream::Http { first_head, policy } => {
+                Upstream::Http { first_head, config } => {
                     remote.set_nodelay(true)?;
 
                     let mut stream = crate::http_rewrite::RequestStream::new(
-                        policy,
+                        config.policy,
                         MAX_REQUEST_HEAD_SIZE,
                     );
                     let mut rewritten = Vec::with_capacity(first_head.len() + 64);
                     let push_result = stream.push(&first_head, &mut rewritten);
 
-                    let fallback = policy == crate::http_rewrite::RewritePolicy::Fallback;
+                    let fallback = config.policy == crate::http_rewrite::RewritePolicy::Fallback;
                     flush_rewrite_stats(&mut stream, &stats, host, fallback);
 
                     if let Err(anomaly) = push_result {
@@ -544,7 +544,7 @@ async fn connect_and_tunnel(
 async fn handle_http(
     mut client_socket: TcpStream,
     stats: Arc<ProxyStats>,
-    policy: crate::http_rewrite::RewritePolicy,
+    config: Arc<RuntimeConfig>,
 ) -> Result<(), ProxyError> {
     // Read headers incrementally — no large upfront buffer
     let mut raw_headers = Vec::new();
@@ -626,7 +626,7 @@ async fn handle_http(
             port,
             Upstream::Http {
                 first_head: raw_headers.clone(),
-                policy,
+                config: config.clone(),
             },
             |_e| {},
             stats,
@@ -638,7 +638,13 @@ async fn handle_http(
 }
 
 // SOCKS5 server implementation (RFC 1928) — no-auth, CONNECT only.
-async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+async fn handle_socks5(
+    mut client_socket: TcpStream,
+    stats: Arc<ProxyStats>,
+    config: Arc<RuntimeConfig>,
+) -> Result<(), ProxyError> {
+    // Unused until the RFC 1929 handshake lands; keeps the migration warning-free.
+    let _ = &config;
     // --- Method negotiation ---
     // Client: VER | NMETHODS | METHODS...
     let mut header = [0u8; 2];

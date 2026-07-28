@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use rust_proxy::http_rewrite::RewritePolicy;
-use rust_proxy::{handle_client, Ordering, ProxyStats};
+use rust_proxy::{handle_client, Ordering, ProxyStats, RuntimeConfig};
 
 /// Origin that records the exact bytes it receives, then replies.
 async fn recording_origin(listener: TcpListener) -> Vec<u8> {
@@ -45,6 +45,14 @@ async fn recording_origin(listener: TcpListener) -> Vec<u8> {
 /// Run one client byte-stream through a real proxy connection and return what
 /// the origin actually received.
 async fn proxy_roundtrip(client_bytes: &[u8], policy: RewritePolicy) -> (Vec<u8>, Arc<ProxyStats>) {
+    proxy_roundtrip_with(client_bytes, Arc::new(RuntimeConfig::anonymous(policy))).await
+}
+
+/// Same, with an explicit runtime configuration, for the auth cases.
+async fn proxy_roundtrip_with(
+    client_bytes: &[u8],
+    config: Arc<RuntimeConfig>,
+) -> (Vec<u8>, Arc<ProxyStats>) {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
     let origin_task = tokio::spawn(recording_origin(origin));
@@ -56,7 +64,7 @@ async fn proxy_roundtrip(client_bytes: &[u8], policy: RewritePolicy) -> (Vec<u8>
 
     tokio::spawn(async move {
         let (socket, _) = proxy.accept().await.unwrap();
-        let _ = handle_client(socket, stats_for_proxy, policy).await;
+        let _ = handle_client(socket, stats_for_proxy, config).await;
     });
 
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();

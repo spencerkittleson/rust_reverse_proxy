@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use rust_proxy::http_rewrite::RewritePolicy;
-use rust_proxy::{handle_client, ProxyStats};
+use rust_proxy::{handle_client, ProxyStats, RuntimeConfig};
 
 const RESPONSE: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
 
@@ -69,7 +69,8 @@ async fn proxied_bytes(request: &str, origin_placeholder: &str) -> Vec<u8> {
     let stats = Arc::new(ProxyStats::new());
     tokio::spawn(async move {
         let (socket, _) = proxy.accept().await.unwrap();
-        let _ = handle_client(socket, stats, RewritePolicy::FailClosed).await;
+        let config = Arc::new(RuntimeConfig::anonymous(RewritePolicy::FailClosed));
+        let _ = handle_client(socket, stats, config).await;
     });
 
     let wire = request.replace(origin_placeholder, &origin_addr.to_string());
