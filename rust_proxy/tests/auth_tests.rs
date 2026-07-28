@@ -317,3 +317,172 @@ fn a_populated_allowlist_is_a_union() {
     assert!(addr_allowed(&list, ip("10.9.9.9")));
     assert!(!addr_allowed(&list, ip("192.168.1.1")));
 }
+
+use clap::Parser;
+use rust_proxy::http_rewrite::RewritePolicy;
+use rust_proxy::{build_runtime_config, load_credentials_file, Args, RuntimeConfig};
+use std::io::Write;
+
+fn args_from(extra: &[&str]) -> Args {
+    let mut argv = vec!["rust_proxy"];
+    argv.extend_from_slice(extra);
+    Args::try_parse_from(argv).expect("args should parse")
+}
+
+fn write_temp(contents: &str) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(contents.as_bytes()).unwrap();
+    f.flush().unwrap();
+    f
+}
+
+#[test]
+fn starting_with_no_credential_and_no_optout_is_refused() {
+    // Fail closed: an unauthenticated proxy must be an explicit choice.
+    let err = build_runtime_config(&args_from(&[]), None).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("--auth-file"), "{msg}");
+    assert!(msg.contains("RUST_PROXY_AUTH"), "{msg}");
+    assert!(msg.contains("--allow-anonymous"), "{msg}");
+}
+
+#[test]
+fn allow_anonymous_alone_is_accepted_and_has_no_credential() {
+    let cfg = build_runtime_config(&args_from(&["--allow-anonymous"]), None).unwrap();
+    assert!(cfg.auth.is_none());
+    assert!(cfg.allow_from.is_empty());
+    assert_eq!(cfg.policy, RewritePolicy::FailClosed);
+}
+
+#[test]
+fn a_credential_and_allow_anonymous_together_is_refused() {
+    // Contradictory intent must not resolve silently in either direction.
+    let err =
+        build_runtime_config(&args_from(&["--allow-anonymous"]), Some("a:b".into())).unwrap_err();
+    assert!(err.to_string().contains("cannot be combined"), "{err}");
+}
+
+#[test]
+fn the_env_var_supplies_a_credential() {
+    let cfg = build_runtime_config(&args_from(&[]), Some("alice:one".into())).unwrap();
+    assert_eq!(cfg.auth.as_ref().unwrap().len(), 1);
+    assert!(cfg.auth.as_ref().unwrap().verify_pair(b"alice", b"one"));
+}
+
+#[test]
+fn a_malformed_env_value_is_refused() {
+    assert!(build_runtime_config(&args_from(&[]), Some("no-colon".into())).is_err());
+}
+
+#[test]
+fn the_auth_file_supplies_credentials() {
+    let f = write_temp("alice:one\nbob:two\n");
+    let path = f.path().to_str().unwrap();
+    let cfg = build_runtime_config(&args_from(&["--auth-file", path]), None).unwrap();
+    assert_eq!(cfg.auth.as_ref().unwrap().len(), 2);
+}
+
+#[test]
+fn the_auth_file_wins_over_the_env_var() {
+    // A stale environment variable must never override the file the operator
+    // just edited.
+    let f = write_temp("fromfile:one\n");
+    let path = f.path().to_str().unwrap();
+    let cfg = build_runtime_config(
+        &args_from(&["--auth-file", path]),
+        Some("fromenv:two".into()),
+    )
+    .unwrap();
+    let creds = cfg.auth.as_ref().unwrap();
+    assert!(creds.verify_pair(b"fromfile", b"one"));
+    assert!(!creds.verify_pair(b"fromenv", b"two"));
+}
+
+#[test]
+fn a_missing_auth_file_is_refused_with_the_path_named() {
+    let err = build_runtime_config(
+        &args_from(&["--auth-file", "/nonexistent/rust_proxy_auth"]),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("/nonexistent/rust_proxy_auth"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_comments_only_auth_file_is_refused() {
+    let f = write_temp("# no users yet\n");
+    assert!(load_credentials_file(f.path().to_str().unwrap()).is_err());
+}
+
+#[test]
+fn allow_from_specs_are_parsed_and_bad_ones_refused() {
+    let cfg = build_runtime_config(
+        &args_from(&[
+            "--allow-anonymous",
+            "--allow-from",
+            "127.0.0.1",
+            "--allow-from",
+            "10.0.0.0/8",
+        ]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.allow_from.len(), 2);
+
+    let err = build_runtime_config(
+        &args_from(&["--allow-anonymous", "--allow-from", "nope"]),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("nope"), "{err}");
+}
+
+#[test]
+fn an_allowlist_is_not_a_substitute_for_a_credential() {
+    // Address filtering is not authentication. Without --allow-anonymous this
+    // must still refuse to start.
+    assert!(build_runtime_config(&args_from(&["--allow-from", "10.0.0.0/8"]), None).is_err());
+}
+
+#[test]
+fn auth_flags_compose_with_the_existing_ones() {
+    let cfg = build_runtime_config(
+        &args_from(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9999",
+            "--rewrite-fallback",
+            "--allow-anonymous",
+        ]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.policy, RewritePolicy::Fallback);
+}
+
+#[test]
+fn help_text_states_the_open_relay_cost_of_allow_anonymous() {
+    // A flag whose downside is discoverable only by reading the design doc is
+    // a trap. Same standard already applied to --rewrite-fallback.
+    let help = Args::try_parse_from(["rust_proxy", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("--allow-anonymous"), "{help}");
+    assert!(help.contains("--auth-file"), "{help}");
+    assert!(help.contains("--allow-from"), "{help}");
+    assert!(
+        help.to_lowercase().contains("open relay"),
+        "help must state the cost: {help}"
+    );
+}
+
+#[test]
+fn anonymous_constructor_is_credential_free() {
+    let cfg = RuntimeConfig::anonymous(RewritePolicy::FailClosed);
+    assert!(cfg.auth.is_none());
+    assert!(cfg.allow_from.is_empty());
+}

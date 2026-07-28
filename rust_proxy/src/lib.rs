@@ -180,6 +180,21 @@ pub struct Args {
     /// connection. Leaks proxy presence to the origin for each affected request.
     #[arg(long, default_value_t = false)]
     pub rewrite_fallback: bool,
+
+    /// Path to a credentials file: one `user:password` per line, `#` comments
+    /// allowed. Takes precedence over RUST_PROXY_AUTH.
+    #[arg(long, value_name = "PATH")]
+    pub auth_file: Option<String>,
+
+    /// Run without any credential. This makes the proxy an open relay to
+    /// anything that can reach the port.
+    #[arg(long, default_value_t = false)]
+    pub allow_anonymous: bool,
+
+    /// Only accept connections from this address or CIDR range. Repeatable.
+    /// Omitted means every source address is accepted.
+    #[arg(long, value_name = "CIDR")]
+    pub allow_from: Vec<String>,
 }
 
 impl Args {
@@ -190,6 +205,116 @@ impl Args {
             crate::http_rewrite::RewritePolicy::FailClosed
         }
     }
+}
+
+/// Environment variable holding a single `user:password` credential.
+pub const AUTH_ENV_VAR: &str = "RUST_PROXY_AUTH";
+
+/// Per-connection policy: what to rewrite, who may connect, who is trusted.
+///
+/// Replaces the bare `RewritePolicy` that used to be threaded through the
+/// handlers, so later flags land in one place instead of growing the parameter
+/// list again.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub policy: crate::http_rewrite::RewritePolicy,
+    /// `None` means `--allow-anonymous`. Inner `Arc` so `RequestStream` holds a
+    /// cheap clone rather than copying the credential set per connection.
+    pub auth: Option<Arc<crate::auth::Credentials>>,
+    /// Empty means no source filtering at all, not deny-all.
+    pub allow_from: Vec<crate::auth::Cidr>,
+}
+
+impl RuntimeConfig {
+    /// No credential, no allowlist. For `--allow-anonymous` and for tests.
+    pub fn anonymous(policy: crate::http_rewrite::RewritePolicy) -> Self {
+        Self {
+            policy,
+            auth: None,
+            allow_from: Vec::new(),
+        }
+    }
+}
+
+/// Read and parse a credentials file.
+///
+/// Warns about loose permissions rather than refusing: on a router the file may
+/// legitimately be root-owned with a group that needs it, and refusing to start
+/// over a mode bit would be worse than a warning the operator can act on.
+pub fn load_credentials_file(path: &str) -> Result<crate::auth::Credentials, ProxyError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ProxyError::from(format!("cannot read --auth-file {path}: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    "--auth-file {} is readable beyond its owner (mode {:o}); chmod 600 it",
+                    path, mode
+                );
+            }
+        }
+    }
+
+    crate::auth::Credentials::parse_file_contents(&text)
+        .map_err(|e| ProxyError::from(format!("--auth-file {path}: {e}")))
+}
+
+/// Build the runtime configuration, refusing to start on a contradictory or
+/// dangerously incomplete combination of flags.
+///
+/// `env_auth` is passed in rather than read from the process environment so
+/// tests never race on a global.
+pub fn build_runtime_config(
+    args: &Args,
+    env_auth: Option<String>,
+) -> Result<RuntimeConfig, ProxyError> {
+    let creds = match (&args.auth_file, env_auth) {
+        (Some(path), env) => {
+            if env.is_some() {
+                warn!(
+                    "{} is set but --auth-file takes precedence; ignoring the environment variable",
+                    AUTH_ENV_VAR
+                );
+            }
+            Some(load_credentials_file(path)?)
+        }
+        (None, Some(value)) => Some(
+            crate::auth::Credentials::parse_file_contents(&value)
+                .map_err(|e| ProxyError::from(format!("{AUTH_ENV_VAR}: {e}")))?,
+        ),
+        (None, None) => None,
+    };
+
+    if creds.is_some() && args.allow_anonymous {
+        return Err(
+            "--allow-anonymous cannot be combined with a configured credential; pick one".into(),
+        );
+    }
+    if creds.is_none() && !args.allow_anonymous {
+        return Err(format!(
+            "no credential configured. Pass --auth-file <path>, set {AUTH_ENV_VAR}=user:password, \
+             or pass --allow-anonymous to run an open relay on purpose"
+        )
+        .into());
+    }
+
+    let mut allow_from = Vec::with_capacity(args.allow_from.len());
+    for spec in &args.allow_from {
+        allow_from.push(
+            crate::auth::Cidr::parse(spec)
+                .map_err(|e| ProxyError::from(format!("--allow-from: {e}")))?,
+        );
+    }
+
+    Ok(RuntimeConfig {
+        policy: args.rewrite_policy(),
+        auth: creds.map(Arc::new),
+        allow_from,
+    })
 }
 
 // Optimized function to find end of HTTP headers
