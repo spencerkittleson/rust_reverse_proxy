@@ -547,6 +547,11 @@ cargo clippy -- -D warnings
 
 ## Troubleshooting
 
+> Commands below omit authentication flags for brevity, as noted in Quick
+> Start. Without one of `--auth-file`, `RUST_PROXY_AUTH`, or
+> `--allow-anonymous`, the proxy exits immediately — see
+> [Authentication](#authentication).
+
 ### Common Issues
 
 1. **Port already in use**: Change port with `--port` flag
