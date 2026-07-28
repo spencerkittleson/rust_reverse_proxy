@@ -536,6 +536,7 @@ async fn connect_and_tunnel(
                     let mut stream = crate::http_rewrite::RequestStream::new(
                         config.policy,
                         MAX_REQUEST_HEAD_SIZE,
+                        config.auth.clone(),
                     );
                     let mut rewritten = Vec::with_capacity(first_head.len() + 64);
                     let push_result = stream.push(&first_head, &mut rewritten);
@@ -543,20 +544,32 @@ async fn connect_and_tunnel(
                     let fallback = config.policy == crate::http_rewrite::RewritePolicy::Fallback;
                     flush_rewrite_stats(&mut stream, &stats, host, fallback);
 
-                    if let Err(anomaly) = push_result {
+                    if let Err(err) = push_result {
                         // Nothing has gone upstream yet, so the client can still
                         // be told. Mid-stream failures cannot be, which is why
                         // the relay path just closes.
-                        warn!(
-                            "Rewrite anomaly '{}' on first request to {}:{} — refusing",
-                            anomaly.name(),
-                            host,
-                            port
-                        );
                         stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                        client_socket
-                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                            .await?;
+                        match err {
+                            crate::http_rewrite::PushError::Unauthorized => {
+                                // Unreachable in practice: `handle_http` already
+                                // gated this head. Answering correctly anyway
+                                // beats an `unreachable!` in a security path.
+                                stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                warn!("Unauthenticated request to {}:{} — refusing", host, port);
+                                return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
+                            }
+                            crate::http_rewrite::PushError::Anomaly(anomaly) => {
+                                warn!(
+                                    "Rewrite anomaly '{}' on first request to {}:{} — refusing",
+                                    anomaly.name(),
+                                    host,
+                                    port
+                                );
+                                client_socket
+                                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                                    .await?;
+                            }
+                        }
                         return Ok(());
                     }
 
@@ -1002,15 +1015,14 @@ async fn tunnel_fast(
                         .store(guard.upgrade_offered(), Ordering::Relaxed);
                     drop(guard);
 
-                    if let Err(anomaly) = result {
+                    if let Err(err) = result {
                         // Mid-stream, so no status line can be injected; closing
                         // is the only option that does not leak.
-                        warn!(
-                            "Rewrite anomaly '{}' for {} — closing connection",
-                            anomaly.name(),
-                            out_host
-                        );
-                        return Err(ProxyError::from("rewrite anomaly"));
+                        if matches!(err, crate::http_rewrite::PushError::Unauthorized) {
+                            out_stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        warn!("{} for {} — closing connection", err, out_host);
+                        return Err(ProxyError::from("refusing to forward"));
                     }
                     Ok(Transformed::Replaced(rewritten))
                 },

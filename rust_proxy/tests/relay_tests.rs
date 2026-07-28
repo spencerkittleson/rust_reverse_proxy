@@ -302,3 +302,26 @@ async fn a_refused_request_with_a_body_still_receives_the_challenge() {
     assert!(text.contains("Proxy-Authenticate: Basic"), "{text:?}");
     assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn a_later_request_without_the_credential_never_reaches_the_origin() {
+    // The bypass Task 7 closes, observed at the socket: one authenticated
+    // request must not unlock the connection for the ones behind it. This is
+    // also the only test that proves `connect_and_tunnel` actually hands the
+    // credential set to the `RequestStream`; a wiring regression there would
+    // pass every unit test in `http_rewrite_tests`.
+    let request = b"GET http://ORIGIN/one HTTP/1.1\r\nHost: ORIGIN\r\n\
+                    Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n\
+                    GET http://ORIGIN/two HTTP/1.1\r\nHost: ORIGIN\r\n\r\n";
+    let (received, stats) = proxy_roundtrip_with(request, auth_config("user:secret")).await;
+
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        !text.contains("/two"),
+        "an unauthenticated second request reached the origin: {text:?}"
+    );
+    assert!(
+        stats.auth_failures.load(Ordering::Relaxed) >= 1,
+        "the second request was not recorded as an auth failure"
+    );
+}
