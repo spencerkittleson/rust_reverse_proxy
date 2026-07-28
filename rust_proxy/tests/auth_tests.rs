@@ -183,3 +183,14 @@ fn reason_codes_never_contain_credential_material() {
     assert!(AuthResult::Granted.is_granted());
     assert!(!AuthResult::Missing.is_granted());
 }
+
+#[test]
+fn debug_output_never_reveals_a_credential() {
+    // This type ends up inside a Debug-deriving config; a derived Debug would
+    // put the password in any log line or panic message that formats it.
+    let rendered = format!("{:?}", creds("alice:supersecret\nbob:hunter2\n"));
+    assert!(!rendered.contains("supersecret"), "{rendered}");
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("alice"), "{rendered}");
+    assert!(rendered.contains('2'), "entry count should be visible: {rendered}");
+}

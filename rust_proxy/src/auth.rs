@@ -52,11 +52,22 @@ impl AuthResult {
 }
 
 /// The set of `user:password` pairs this proxy accepts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     /// Stored pre-joined as `user:password` bytes, which is exactly the form
     /// both the HTTP and SOCKS5 paths compare against.
     joined: Vec<Vec<u8>>,
+}
+
+/// Deliberately opaque: `joined` holds plaintext `user:password` bytes, and
+/// this type is embedded in a `Debug`-deriving config. A derived `Debug` would
+/// leak the password into any log line, panic message, or assertion failure.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("entries", &self.joined.len())
+            .finish()
+    }
 }
 
 impl Credentials {
