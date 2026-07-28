@@ -8,8 +8,12 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_proxy_integration() {
     // Start proxy server in background
+    // --allow-anonymous conflicts with a configured credential, and the
+    // subprocess inherits our environment. Without this, a developer with
+    // RUST_PROXY_AUTH exported sees all of these tests hang rather than fail.
     let mut child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3130", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -47,6 +51,7 @@ async fn test_http_proxy_request() {
     // Start proxy
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3132", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -88,6 +93,7 @@ async fn test_connect_proxy_request() {
     // Start proxy
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3134", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -133,6 +139,7 @@ async fn test_socks5_connect_ipv4() {
     // Proxy on port 3159 (per user instruction)
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3159", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -217,6 +224,7 @@ async fn test_socks5_connect_domain() {
     // Distinct proxy port to avoid colliding with parallel tests.
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3161", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -283,6 +291,7 @@ async fn test_proxy_handles_invalid_requests() {
     // Start proxy
     let mut proxy_child = Command::new("cargo")
         .args(&["run", "--", "--host", "127.0.0.1", "--port", "3135", "--log-level", "error", "--allow-anonymous"])
+        .env_remove("RUST_PROXY_AUTH")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
