@@ -53,6 +53,12 @@ pub struct ProxyStats {
     pub rewrite_fallback_forwarded: AtomicU64,
     /// Whether `--rewrite-fallback` is enabled, for the report banner.
     pub rewrite_fallback_active: AtomicBool,
+    /// Requests refused for a missing, malformed, or unrecognized credential.
+    pub auth_failures: AtomicU64,
+    /// Connections refused because the source address is outside --allow-from.
+    pub acl_rejections: AtomicU64,
+    /// Whether `--allow-anonymous` is enabled, for the report banner.
+    pub allow_anonymous_active: AtomicBool,
     pub start_time: Instant,
 }
 
@@ -77,6 +83,9 @@ impl ProxyStats {
             rewrite_anomaly_last_host: Default::default(),
             rewrite_fallback_forwarded: AtomicU64::new(0),
             rewrite_fallback_active: AtomicBool::new(false),
+            auth_failures: AtomicU64::new(0),
+            acl_rejections: AtomicU64::new(0),
+            allow_anonymous_active: AtomicBool::new(false),
             start_time: Instant::now(),
         }
     }
@@ -112,6 +121,11 @@ impl ProxyStats {
             .store(active, Ordering::Relaxed);
     }
 
+    pub fn set_anonymous_active(&self, active: bool) {
+        self.allow_anonymous_active
+            .store(active, Ordering::Relaxed);
+    }
+
     pub fn log_stats(&self) {
         let uptime = self.start_time.elapsed();
         let total_conn = self.total_connections.load(Ordering::Relaxed);
@@ -144,6 +158,21 @@ impl ProxyStats {
             warn!(
                 "      ⚠ --rewrite-fallback ACTIVE — {} requests forwarded unrewritten (proxy visible to origin)",
                 leaked
+            );
+        }
+
+        // Only non-zero access-control counters print, so a clean run stays quiet.
+        let auth_failures = self.auth_failures.load(Ordering::Relaxed);
+        if auth_failures > 0 {
+            info!("   Auth Failures: {}", auth_failures);
+        }
+        let acl_rejections = self.acl_rejections.load(Ordering::Relaxed);
+        if acl_rejections > 0 {
+            info!("   Source Rejections: {}", acl_rejections);
+        }
+        if self.allow_anonymous_active.load(Ordering::Relaxed) {
+            warn!(
+                "      ⚠ --allow-anonymous ACTIVE — this proxy relays for unauthenticated clients"
             );
         }
 

@@ -486,3 +486,25 @@ fn anonymous_constructor_is_credential_free() {
     assert!(cfg.auth.is_none());
     assert!(cfg.allow_from.is_empty());
 }
+
+use rust_proxy::ProxyStats;
+use std::sync::atomic::Ordering;
+
+#[test]
+fn auth_counters_start_at_zero_and_increment() {
+    let stats = ProxyStats::new();
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.acl_rejections.load(Ordering::Relaxed), 0);
+    assert!(!stats.allow_anonymous_active.load(Ordering::Relaxed));
+
+    stats.auth_failures.fetch_add(2, Ordering::Relaxed);
+    stats.acl_rejections.fetch_add(3, Ordering::Relaxed);
+    stats.set_anonymous_active(true);
+
+    assert_eq!(stats.auth_failures.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.acl_rejections.load(Ordering::Relaxed), 3);
+    assert!(stats.allow_anonymous_active.load(Ordering::Relaxed));
+
+    // log_stats must not panic with the new fields populated.
+    stats.log_stats();
+}

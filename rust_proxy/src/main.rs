@@ -92,6 +92,14 @@ async fn main() -> Result<(), ProxyError> {
         warn!("--rewrite-fallback is enabled: requests that fail rewriting will be");
         warn!("forwarded unrewritten, revealing proxy presence to the origin.");
     }
+
+    stats.set_anonymous_active(config.auth.is_none());
+    if config.auth.is_none() {
+        warn!("--allow-anonymous is enabled: any client that can reach {} may relay", addr);
+        if config.allow_from.is_empty() {
+            warn!("and no --allow-from restriction is set, so that is every reachable host.");
+        }
+    }
     
     // Start periodic statistics logging task
     tokio::spawn(async move {
