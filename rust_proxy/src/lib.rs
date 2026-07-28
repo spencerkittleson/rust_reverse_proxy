@@ -14,6 +14,7 @@ pub use url::Url;
 pub mod windows;
 
 pub mod http_rewrite;
+pub mod auth;
 
 use crate::http_rewrite::RewriteAnomaly;
 
@@ -30,6 +31,21 @@ pub const STATS_FLUSH_THRESHOLD: u64 = 65536;
 /// jars and `Authorization: Bearer` tokens exceed 8KB routinely, and that was the
 /// likeliest source of spurious rewrite anomalies.
 pub const MAX_REQUEST_HEAD_SIZE: usize = 65536;
+
+/// Cap on the bytes drained from a client we are refusing, so the drain that
+/// prevents an RST from discarding our response cannot itself be turned into an
+/// unbounded read. We are not interested in the refused body, only in emptying
+/// the receive queue.
+pub const MAX_REFUSAL_DRAIN: usize = 65536;
+
+/// Client-facing challenge. `Connection: close` removes any question about
+/// stream state after a rejection; clients reconnect and retry, which is
+/// ordinary Basic behavior. No `Server` and no `Date`, matching the 502s.
+pub const PROXY_AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+    Proxy-Authenticate: Basic realm=\"rust_proxy\"\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\
+    \r\n";
 
 // Statistics tracking
 #[derive(Debug)]
@@ -52,6 +68,12 @@ pub struct ProxyStats {
     pub rewrite_fallback_forwarded: AtomicU64,
     /// Whether `--rewrite-fallback` is enabled, for the report banner.
     pub rewrite_fallback_active: AtomicBool,
+    /// Requests refused for a missing, malformed, or unrecognized credential.
+    pub auth_failures: AtomicU64,
+    /// Connections refused because the source address is outside --allow-from.
+    pub acl_rejections: AtomicU64,
+    /// Whether no credential is configured, for the report banner.
+    pub allow_anonymous_active: AtomicBool,
     pub start_time: Instant,
 }
 
@@ -76,6 +98,9 @@ impl ProxyStats {
             rewrite_anomaly_last_host: Default::default(),
             rewrite_fallback_forwarded: AtomicU64::new(0),
             rewrite_fallback_active: AtomicBool::new(false),
+            auth_failures: AtomicU64::new(0),
+            acl_rejections: AtomicU64::new(0),
+            allow_anonymous_active: AtomicBool::new(false),
             start_time: Instant::now(),
         }
     }
@@ -108,6 +133,11 @@ impl ProxyStats {
 
     pub fn set_fallback_active(&self, active: bool) {
         self.rewrite_fallback_active
+            .store(active, Ordering::Relaxed);
+    }
+
+    pub fn set_anonymous_active(&self, active: bool) {
+        self.allow_anonymous_active
             .store(active, Ordering::Relaxed);
     }
 
@@ -157,6 +187,21 @@ impl ProxyStats {
                 None => info!("      {}: {}", anomaly.name(), count),
             }
         }
+
+        // Only non-zero access-control counters print, so a clean run stays quiet.
+        let auth_failures = self.auth_failures.load(Ordering::Relaxed);
+        if auth_failures > 0 {
+            info!("   Auth Failures: {} requests", auth_failures);
+        }
+        let acl_rejections = self.acl_rejections.load(Ordering::Relaxed);
+        if acl_rejections > 0 {
+            info!("   Source Rejections: {} connections", acl_rejections);
+        }
+        if self.allow_anonymous_active.load(Ordering::Relaxed) {
+            warn!(
+                "      ⚠ NO CREDENTIAL CONFIGURED — this proxy relays for unauthenticated clients"
+            );
+        }
     }
 }
 
@@ -179,6 +224,21 @@ pub struct Args {
     /// connection. Leaks proxy presence to the origin for each affected request.
     #[arg(long, default_value_t = false)]
     pub rewrite_fallback: bool,
+
+    /// Path to a credentials file: one `user:password` per line, `#` comments
+    /// allowed. Takes precedence over RUST_PROXY_AUTH.
+    #[arg(long, value_name = "PATH")]
+    pub auth_file: Option<String>,
+
+    /// Run without any credential. This makes the proxy an open relay to
+    /// anything that can reach the port.
+    #[arg(long, default_value_t = false)]
+    pub allow_anonymous: bool,
+
+    /// Only accept connections from this address or CIDR range. Repeatable.
+    /// Omitted means every source address is accepted.
+    #[arg(long, value_name = "CIDR")]
+    pub allow_from: Vec<String>,
 }
 
 impl Args {
@@ -189,6 +249,116 @@ impl Args {
             crate::http_rewrite::RewritePolicy::FailClosed
         }
     }
+}
+
+/// Environment variable holding a single `user:password` credential.
+pub const AUTH_ENV_VAR: &str = "RUST_PROXY_AUTH";
+
+/// Per-connection policy: what to rewrite, who may connect, who is trusted.
+///
+/// Replaces the bare `RewritePolicy` that used to be threaded through the
+/// handlers, so later flags land in one place instead of growing the parameter
+/// list again.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub policy: crate::http_rewrite::RewritePolicy,
+    /// `None` means `--allow-anonymous`. Inner `Arc` so `RequestStream` holds a
+    /// cheap clone rather than copying the credential set per connection.
+    pub auth: Option<Arc<crate::auth::Credentials>>,
+    /// Empty means no source filtering at all, not deny-all.
+    pub allow_from: Vec<crate::auth::Cidr>,
+}
+
+impl RuntimeConfig {
+    /// No credential, no allowlist. For `--allow-anonymous` and for tests.
+    pub fn anonymous(policy: crate::http_rewrite::RewritePolicy) -> Self {
+        Self {
+            policy,
+            auth: None,
+            allow_from: Vec::new(),
+        }
+    }
+}
+
+/// Read and parse a credentials file.
+///
+/// Warns about loose permissions rather than refusing: on a router the file may
+/// legitimately be root-owned with a group that needs it, and refusing to start
+/// over a mode bit would be worse than a warning the operator can act on.
+pub fn load_credentials_file(path: &str) -> Result<crate::auth::Credentials, ProxyError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ProxyError::from(format!("cannot read --auth-file {path}: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    "--auth-file {} is readable beyond its owner (mode {:o}); chmod 600 it",
+                    path, mode
+                );
+            }
+        }
+    }
+
+    crate::auth::Credentials::parse_file_contents(&text)
+        .map_err(|e| ProxyError::from(format!("--auth-file {path}: {e}")))
+}
+
+/// Build the runtime configuration, refusing to start on a contradictory or
+/// dangerously incomplete combination of flags.
+///
+/// `env_auth` is passed in rather than read from the process environment so
+/// tests never race on a global.
+pub fn build_runtime_config(
+    args: &Args,
+    env_auth: Option<String>,
+) -> Result<RuntimeConfig, ProxyError> {
+    let creds = match (&args.auth_file, env_auth) {
+        (Some(path), env) => {
+            if env.is_some() {
+                warn!(
+                    "{} is set but --auth-file takes precedence; ignoring the environment variable",
+                    AUTH_ENV_VAR
+                );
+            }
+            Some(load_credentials_file(path)?)
+        }
+        (None, Some(value)) => Some(
+            crate::auth::Credentials::parse_file_contents(&value)
+                .map_err(|e| ProxyError::from(format!("{AUTH_ENV_VAR}: {e}")))?,
+        ),
+        (None, None) => None,
+    };
+
+    if creds.is_some() && args.allow_anonymous {
+        return Err(
+            "--allow-anonymous cannot be combined with a configured credential; pick one".into(),
+        );
+    }
+    if creds.is_none() && !args.allow_anonymous {
+        return Err(format!(
+            "no credential configured. Pass --auth-file <path>, set {AUTH_ENV_VAR}=user:password, \
+             or pass --allow-anonymous to run an open relay on purpose"
+        )
+        .into());
+    }
+
+    let mut allow_from = Vec::with_capacity(args.allow_from.len());
+    for spec in &args.allow_from {
+        allow_from.push(
+            crate::auth::Cidr::parse(spec)
+                .map_err(|e| ProxyError::from(format!("--allow-from: {e}")))?,
+        );
+    }
+
+    Ok(RuntimeConfig {
+        policy: args.rewrite_policy(),
+        auth: creds.map(Arc::new),
+        allow_from,
+    })
 }
 
 // Optimized function to find end of HTTP headers
@@ -279,12 +449,25 @@ fn analyze_ssl_error(host: &str, port: u16, error: &std::io::Error) {
 pub async fn handle_client(
     client_socket: TcpStream,
     stats: Arc<ProxyStats>,
-    policy: crate::http_rewrite::RewritePolicy,
+    config: Arc<RuntimeConfig>,
 ) -> Result<(), ProxyError> {
     // Configure socket options for better performance
     client_socket.set_nodelay(true)?;
 
     let client_addr = client_socket.peer_addr()?;
+
+    // Before the connection counters and before reading a single byte. Closing
+    // in silence is deliberate: an error page would confirm to a scanner that a
+    // proxy is listening here.
+    if !crate::auth::addr_allowed(&config.allow_from, client_addr.ip()) {
+        stats.acl_rejections.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "Refusing connection from {}: outside --allow-from",
+            client_addr
+        );
+        return Ok(());
+    }
+
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
     stats.active_connections.fetch_add(1, Ordering::Relaxed);
     debug!("Handling client connection from: {}", client_addr);
@@ -298,10 +481,10 @@ pub async fn handle_client(
     }
 
     let result = if peek_buf[0] == 0x05 {
-        // SOCKS5 is a blind byte relay: nothing to rewrite.
-        handle_socks5(client_socket, stats.clone()).await
+        // SOCKS5 is a blind byte relay after the handshake: nothing to rewrite.
+        handle_socks5(client_socket, stats.clone(), config).await
     } else {
-        handle_http(client_socket, stats.clone(), policy).await
+        handle_http(client_socket, stats.clone(), config).await
     };
 
     // Cleanup: decrement active connections counter
@@ -337,7 +520,7 @@ pub enum Upstream {
     /// Plain HTTP: rewrite this head, then every later head on the connection.
     Http {
         first_head: Vec<u8>,
-        policy: crate::http_rewrite::RewritePolicy,
+        config: Arc<RuntimeConfig>,
     },
 }
 
@@ -360,33 +543,49 @@ async fn connect_and_tunnel(
                         .await?;
                     tunnel_fast(client_socket, remote, None, host, stats).await
                 }
-                Upstream::Http { first_head, policy } => {
+                Upstream::Http { first_head, config } => {
                     remote.set_nodelay(true)?;
 
                     let mut stream = crate::http_rewrite::RequestStream::new(
-                        policy,
+                        config.policy,
                         MAX_REQUEST_HEAD_SIZE,
+                        config.auth.clone(),
                     );
                     let mut rewritten = Vec::with_capacity(first_head.len() + 64);
                     let push_result = stream.push(&first_head, &mut rewritten);
 
-                    let fallback = policy == crate::http_rewrite::RewritePolicy::Fallback;
+                    let fallback = config.policy == crate::http_rewrite::RewritePolicy::Fallback;
                     flush_rewrite_stats(&mut stream, &stats, host, fallback);
 
-                    if let Err(anomaly) = push_result {
+                    if let Err(err) = push_result {
                         // Nothing has gone upstream yet, so the client can still
                         // be told. Mid-stream failures cannot be, which is why
                         // the relay path just closes.
-                        warn!(
-                            "Rewrite anomaly '{}' on first request to {}:{} — refusing",
-                            anomaly.name(),
-                            host,
-                            port
-                        );
-                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
-                        client_socket
-                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                            .await?;
+                        match err {
+                            crate::http_rewrite::PushError::Unauthorized => {
+                                // Reachable: `handle_http` gates only the first
+                                // head of the buffer it read, so a pipelined
+                                // second head arrives here unchecked. Nothing
+                                // has gone upstream yet — `remote.write_all` is
+                                // below — so this is both correct and the last
+                                // chance to say it.
+                                stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                warn!("Unauthenticated request to {}:{} — refusing", host, port);
+                                return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
+                            }
+                            crate::http_rewrite::PushError::Anomaly(anomaly) => {
+                                stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    "Rewrite anomaly '{}' on first request to {}:{} — refusing",
+                                    anomaly.name(),
+                                    host,
+                                    port
+                                );
+                                client_socket
+                                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                                    .await?;
+                            }
+                        }
                         return Ok(());
                     }
 
@@ -415,10 +614,37 @@ async fn connect_and_tunnel(
     }
 }
 
+/// Send a final response to the client and close cleanly.
+///
+/// Dropping a socket that still has unread bytes in its receive queue makes
+/// Linux send an RST, which can discard the response we just wrote — so a
+/// refused request that carried a body would surface to the client as a
+/// connection reset instead of the status we sent. Shutting down the write half
+/// gives the client a FIN so it knows the response is complete, and draining
+/// what it already sent leaves nothing to reset over.
+///
+/// The drain is bounded in both bytes (`MAX_REFUSAL_DRAIN`) and time
+/// (`CONNECT_TIMEOUT`): a client we are refusing must not be able to make us
+/// read indefinitely.
+async fn refuse_with(mut client_socket: TcpStream, response: &[u8]) -> Result<(), ProxyError> {
+    client_socket.write_all(response).await?;
+    let _ = client_socket.shutdown().await;
+
+    let mut scratch = [0u8; 1024];
+    let mut drained = 0usize;
+    while drained < MAX_REFUSAL_DRAIN {
+        match timeout(CONNECT_TIMEOUT, client_socket.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
+    Ok(())
+}
+
 async fn handle_http(
     mut client_socket: TcpStream,
     stats: Arc<ProxyStats>,
-    policy: crate::http_rewrite::RewritePolicy,
+    config: Arc<RuntimeConfig>,
 ) -> Result<(), ProxyError> {
     // Read headers incrementally — no large upfront buffer
     let mut raw_headers = Vec::new();
@@ -449,6 +675,22 @@ async fn handle_http(
 
     if parts.len() < 3 {
         return Ok(());
+    }
+
+    // Before any origin dial: an unauthenticated client must not be able to
+    // make this proxy open an outbound connection. This is also the last point
+    // at which a status line can still be sent to the client.
+    if let Some(creds) = config.auth.as_deref() {
+        let outcome = creds.check_head(&raw_headers);
+        if !outcome.is_granted() {
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            let peer = client_socket
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            warn!("Refusing request from {}: {}", peer, outcome.reason());
+            return refuse_with(client_socket, PROXY_AUTH_REQUIRED).await;
+        }
     }
 
     let method = parts[0];
@@ -500,7 +742,7 @@ async fn handle_http(
             port,
             Upstream::Http {
                 first_head: raw_headers.clone(),
-                policy,
+                config: config.clone(),
             },
             |_e| {},
             stats,
@@ -512,7 +754,11 @@ async fn handle_http(
 }
 
 // SOCKS5 server implementation (RFC 1928) — no-auth, CONNECT only.
-async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> Result<(), ProxyError> {
+async fn handle_socks5(
+    mut client_socket: TcpStream,
+    stats: Arc<ProxyStats>,
+    config: Arc<RuntimeConfig>,
+) -> Result<(), ProxyError> {
     // --- Method negotiation ---
     // Client: VER | NMETHODS | METHODS...
     let mut header = [0u8; 2];
@@ -526,14 +772,51 @@ async fn handle_socks5(mut client_socket: TcpStream, stats: Arc<ProxyStats>) -> 
         timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut methods)).await??;
     }
 
-    // We only support "no authentication" (0x00).
-    if !methods.contains(&0x00) {
+    // With a credential configured, "no authentication" is never offered: a
+    // SOCKS5 client that could still pick 0x00 would be a bypass around the
+    // HTTP gate on the same port.
+    let selected: u8 = if config.auth.is_some() { 0x02 } else { 0x00 };
+    if !methods.contains(&selected) {
         // 0xFF = NO ACCEPTABLE METHODS
         client_socket.write_all(&[0x05, 0xFF]).await?;
         warn!("SOCKS5 client offered no acceptable auth methods");
         return Ok(());
     }
-    client_socket.write_all(&[0x05, 0x00]).await?;
+    client_socket.write_all(&[0x05, selected]).await?;
+
+    if let Some(creds) = config.auth.as_deref() {
+        // RFC 1929: VER(0x01) | ULEN | UNAME | PLEN | PASSWD.
+        // Note VER is 0x01 here, not 0x05.
+        let mut ver_ulen = [0u8; 2];
+        timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut ver_ulen)).await??;
+        if ver_ulen[0] != 0x01 {
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            warn!("SOCKS5 username/password sub-negotiation had a bad version");
+            return refuse_with(client_socket, &[0x01, 0x01]).await;
+        }
+
+        let mut uname = vec![0u8; ver_ulen[1] as usize];
+        if !uname.is_empty() {
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut uname)).await??;
+        }
+        let mut plen = [0u8; 1];
+        timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut plen)).await??;
+        let mut passwd = vec![0u8; plen[0] as usize];
+        if !passwd.is_empty() {
+            timeout(CONNECT_TIMEOUT, client_socket.read_exact(&mut passwd)).await??;
+        }
+
+        if !creds.verify_pair(&uname, &passwd) {
+            stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            // No username in the log: a client may have put its password there.
+            warn!("SOCKS5 authentication failed for {}", client_socket
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_string()));
+            return refuse_with(client_socket, &[0x01, 0x01]).await;
+        }
+        client_socket.write_all(&[0x01, 0x00]).await?;
+    }
 
     // --- Request ---
     // VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
@@ -783,15 +1066,14 @@ async fn tunnel_fast(
                         .store(guard.upgrade_offered(), Ordering::Relaxed);
                     drop(guard);
 
-                    if let Err(anomaly) = result {
+                    if let Err(err) = result {
                         // Mid-stream, so no status line can be injected; closing
                         // is the only option that does not leak.
-                        warn!(
-                            "Rewrite anomaly '{}' for {} — closing connection",
-                            anomaly.name(),
-                            out_host
-                        );
-                        return Err(ProxyError::from("rewrite anomaly"));
+                        if matches!(err, crate::http_rewrite::PushError::Unauthorized) {
+                            out_stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        warn!("{} for {} — closing connection", err, out_host);
+                        return Err(ProxyError::from("refusing to forward"));
                     }
                     Ok(Transformed::Replaced(rewritten))
                 },

@@ -10,7 +10,8 @@ fn test_logging_output_to_file() {
 
     // Start proxy with debug logging redirected to file
     let mut child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3140", "--log-level", "debug"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3140", "--log-level", "debug", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("RUST_LOG", "debug")
@@ -44,7 +45,8 @@ fn test_logging_levels() {
     for level in log_levels {
         // Start proxy with specific log level
         let mut child = Command::new("cargo")
-            .args(&["run", "--", "--host", "127.0.0.1", "--port", "3141", "--log-level", level])
+            .args(&["run", "--", "--host", "127.0.0.1", "--port", "3141", "--log-level", level, "--allow-anonymous"])
+            .env_remove(rust_proxy::AUTH_ENV_VAR)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -72,7 +74,8 @@ fn test_logging_levels() {
 fn test_invalid_log_level_handling() {
     // Test with invalid log level - should default to info
     let mut child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3142", "--log-level", "invalid"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3142", "--log-level", "invalid", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

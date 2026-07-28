@@ -8,7 +8,7 @@ async fn accept_and_spawn(
     listener: &TcpListener,
     semaphore: &Arc<Semaphore>,
     stats: &Arc<ProxyStats>,
-    policy: rust_proxy::http_rewrite::RewritePolicy,
+    config: &Arc<RuntimeConfig>,
 ) {
     let (client_socket, _) = match listener.accept().await {
         Ok(conn) => conn,
@@ -25,10 +25,11 @@ async fn accept_and_spawn(
         }
     };
     let stats_clone = stats.clone();
+    let config_clone = config.clone();
 
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(e) = handle_client(client_socket, stats_clone, policy).await {
+        if let Err(e) = handle_client(client_socket, stats_clone, config_clone).await {
             error!("Error handling client: {}", e);
         }
     });
@@ -53,7 +54,21 @@ async fn main() -> Result<(), ProxyError> {
     env_logger::Builder::from_default_env()
         .filter_level(log_level)
         .init();
-    
+
+    // Validate before touching the host or the network: an invalid credential
+    // configuration must not open a firewall port or bind a listener.
+    // A set-but-empty RUST_PROXY_AUTH means "no credential", not an empty one.
+    let env_auth = std::env::var(AUTH_ENV_VAR)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let config = match build_runtime_config(&args, env_auth) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            std::process::exit(2);
+        }
+    };
+
     #[cfg(windows)]
     {
         if let Err(e) = windows::setup_windows_environment(args.port) {
@@ -72,11 +87,18 @@ async fn main() -> Result<(), ProxyError> {
     let stats = Arc::new(ProxyStats::new());
     let stats_logger = stats.clone();
 
-    let policy = args.rewrite_policy();
     stats.set_fallback_active(args.rewrite_fallback);
     if args.rewrite_fallback {
         warn!("--rewrite-fallback is enabled: requests that fail rewriting will be");
         warn!("forwarded unrewritten, revealing proxy presence to the origin.");
+    }
+
+    stats.set_anonymous_active(config.auth.is_none());
+    if config.auth.is_none() {
+        warn!("No credential is configured: any client that can reach {} may relay through this proxy.", addr);
+        if config.allow_from.is_empty() {
+            warn!("No --allow-from restriction is set either, so that is every host that can reach it.");
+        }
     }
     
     // Start periodic statistics logging task
@@ -101,7 +123,7 @@ async fn main() -> Result<(), ProxyError> {
     tokio::select! {
         _ = async {
             loop {
-                accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept, policy).await;
+                accept_and_spawn(&listener, &sem_for_accept, &stats_for_accept, &config).await;
             }
         } => {},
         _ = signal::ctrl_c() => {

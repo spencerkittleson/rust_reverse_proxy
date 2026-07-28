@@ -8,8 +8,12 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_proxy_integration() {
     // Start proxy server in background
+    // --allow-anonymous conflicts with a configured credential, and the
+    // subprocess inherits our environment. Without this, a developer with
+    // RUST_PROXY_AUTH exported sees all of these tests hang rather than fail.
     let mut child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3130", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3130", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -46,7 +50,8 @@ async fn test_http_proxy_request() {
 
     // Start proxy
     let mut proxy_child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3132", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3132", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -87,7 +92,8 @@ async fn test_connect_proxy_request() {
 
     // Start proxy
     let mut proxy_child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3134", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3134", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -132,7 +138,8 @@ async fn test_socks5_connect_ipv4() {
 
     // Proxy on port 3159 (per user instruction)
     let mut proxy_child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3159", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3159", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -216,7 +223,8 @@ async fn test_socks5_connect_domain() {
 
     // Distinct proxy port to avoid colliding with parallel tests.
     let mut proxy_child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3161", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3161", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -278,11 +286,186 @@ async fn test_socks5_connect_domain() {
     let _ = proxy_child.wait();
 }
 
+/// Spawns a subprocess and waits for it to exit within a bounded time,
+/// then collects its output. Unlike `Command::output()`, this cannot block
+/// forever: the three startup-gate tests below pin a fail-closed security
+/// gate that is supposed to make the process exit(2) before the listener
+/// ever binds. If that gate ever regressed into binding a port and running
+/// forever, `.output()` would hang the whole suite waiting on a process
+/// that will never terminate. Polling `try_wait()` for up to
+/// `Duration::from_secs(2)` (the same startup-wait duration used elsewhere
+/// in this file) turns that hang into a clear, bounded test failure instead.
+fn spawn_and_wait_bounded(command: &mut Command) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to run proxy binary");
+
+    let mut exited = false;
+    for _ in 0..20 {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "startup gate regressed: process was still running after {:?} \
+             (expected an immediate exit(2)); killed it to avoid hanging the suite",
+            Duration::from_secs(2)
+        );
+    }
+
+    child
+        .wait_with_output()
+        .expect("failed to collect subprocess output")
+}
+
+/// Regression: catches a refactor that drops the startup credential gate
+/// entirely, letting the proxy come up wide open when the operator supplied
+/// neither a credential nor an explicit --allow-anonymous opt-out. The gate
+/// runs before the listener binds, so the process exits immediately and there
+/// is no port to pick. `env_remove` is load-bearing: without it, a developer
+/// with the variable exported would satisfy the gate and this test would pass
+/// for the wrong reason.
+#[test]
+fn test_missing_credential_exits_two() {
+    let mut cmd = Command::new("cargo");
+    cmd.args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR);
+    let output = spawn_and_wait_bounded(&mut cmd);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "no credential and no --allow-anonymous must exit 2, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Configuration error"),
+        "stderr should report the configuration error, got: {stderr}"
+    );
+}
+
+/// Regression: catches removal of the `.filter(|v| !v.trim().is_empty())` on
+/// the environment read in `main`. A set-but-blank variable means "no
+/// credential", not "a credential named nothing". The distinguishing evidence
+/// is the message: filtering to `None` produces "no credential configured",
+/// whereas parsing the blank value as a credential file would produce
+/// "no credentials found".
+#[test]
+fn test_whitespace_only_auth_env_is_no_credential() {
+    let mut cmd = Command::new("cargo");
+    cmd.args(&["run", "--", "--host", "127.0.0.1", "--log-level", "error"])
+        .env(rust_proxy::AUTH_ENV_VAR, "   ");
+    let output = spawn_and_wait_bounded(&mut cmd);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "whitespace-only credential must be rejected, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no credential configured"),
+        "blank value must be filtered to None, not parsed as a credential; got: {stderr}"
+    );
+}
+
+/// Regression: catches a change that resolves contradictory intent silently
+/// (for example by letting --allow-anonymous quietly win over a configured
+/// credential, which would disable authentication the operator asked for).
+#[test]
+fn test_credential_plus_allow_anonymous_exits_two() {
+    let mut cmd = Command::new("cargo");
+    cmd.args(&[
+        "run",
+        "--",
+        "--host",
+        "127.0.0.1",
+        "--log-level",
+        "error",
+        "--allow-anonymous",
+    ])
+    .env(rust_proxy::AUTH_ENV_VAR, "user:secret");
+    let output = spawn_and_wait_bounded(&mut cmd);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "credential + --allow-anonymous must exit 2, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be combined"),
+        "stderr should name the conflict, got: {stderr}"
+    );
+}
+
+/// Regression: catches a gate that rejects every configuration. Without this
+/// test the three exit-2 tests above would all still pass even if the
+/// environment-variable credential path were broken and no valid setup could
+/// ever start. A successful start runs forever, so spawn and probe instead of
+/// waiting.
+#[test]
+fn test_valid_auth_env_starts_proxy() {
+    let mut child = Command::new("cargo")
+        .args(&[
+            "run",
+            "--",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3170",
+            "--log-level",
+            "error",
+        ])
+        .env(rust_proxy::AUTH_ENV_VAR, "user:secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start proxy server");
+
+    thread::sleep(Duration::from_secs(2));
+
+    // try_wait() observes the cargo process, not the proxy: if cargo is still
+    // compiling or blocked on the build lock at this point, the child is alive
+    // and the test would pass without a proxy ever having started. Connecting
+    // proves the listener actually bound.
+    let connected = std::net::TcpStream::connect("127.0.0.1:3170").is_ok();
+
+    let exited = child.try_wait().expect("try_wait failed");
+    let still_running = exited.is_none();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        connected,
+        "a valid {} alone must start the proxy, but nothing accepted a connection on 127.0.0.1:3170",
+        rust_proxy::AUTH_ENV_VAR
+    );
+    assert!(
+        still_running,
+        "a valid {} alone must start the proxy, but it exited: {:?}",
+        rust_proxy::AUTH_ENV_VAR, exited
+    );
+}
+
 #[tokio::test]
 async fn test_proxy_handles_invalid_requests() {
     // Start proxy
     let mut proxy_child = Command::new("cargo")
-        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3135", "--log-level", "error"])
+        .args(&["run", "--", "--host", "127.0.0.1", "--port", "3135", "--log-level", "error", "--allow-anonymous"])
+        .env_remove(rust_proxy::AUTH_ENV_VAR)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

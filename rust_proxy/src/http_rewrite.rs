@@ -6,7 +6,12 @@
 //! Canonicalizing anything else would trade one proxy fingerprint for another.
 //!
 //! This module performs no I/O and does no logging, so it is fully testable
-//! without sockets.
+//! without sockets. It depends on `crate::auth` for the per-head credential
+//! check, which is pure for the same reasons — the verdict is returned to the
+//! caller, and the 407 that answers it is written in `lib.rs`.
+
+use crate::auth::Credentials;
+use std::sync::Arc;
 
 pub const CRLF: &[u8] = b"\r\n";
 pub const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
@@ -450,6 +455,33 @@ pub enum RewritePolicy {
     Fallback,
 }
 
+/// Why a `push` refused to forward.
+///
+/// Auth is a separate variant rather than a `RewriteAnomaly` because it is not
+/// a property of the rewrite, and because it must never reach `on_anomaly`:
+/// that is where `--rewrite-fallback` decides to forward verbatim, and no
+/// operator flag may turn an unauthenticated request into a forwarded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    Anomaly(RewriteAnomaly),
+    Unauthorized,
+}
+
+impl From<RewriteAnomaly> for PushError {
+    fn from(a: RewriteAnomaly) -> Self {
+        PushError::Anomaly(a)
+    }
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::Anomaly(a) => write!(f, "rewrite anomaly '{}'", a.name()),
+            PushError::Unauthorized => write!(f, "unauthenticated request"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChunkPhase {
     Size,
@@ -475,6 +507,14 @@ pub struct RequestStream {
     pending: Vec<u8>,
     max_head: usize,
     policy: RewritePolicy,
+    /// `None` means `--allow-anonymous`: no head is checked at all.
+    ///
+    /// Note that `State::Passthrough` also stops checking — `push` returns
+    /// before parsing once the stream latches it. That happens on the
+    /// `Upgrade`/101 path and when a fallback-eligible anomaly fires under
+    /// `--rewrite-fallback`. Both require an already-authenticated connection
+    /// with a fixed origin, which is why it is accepted rather than closed.
+    auth: Option<Arc<Credentials>>,
     anomalies: Vec<RewriteAnomaly>,
     /// Cumulative, for tests and diagnostics.
     requests_sanitized_total: u64,
@@ -485,12 +525,13 @@ pub struct RequestStream {
 }
 
 impl RequestStream {
-    pub fn new(policy: RewritePolicy, max_head: usize) -> Self {
+    pub fn new(policy: RewritePolicy, max_head: usize, auth: Option<Arc<Credentials>>) -> Self {
         Self {
             state: State::ReadingHead,
             pending: Vec::new(),
             max_head,
             policy,
+            auth,
             anomalies: Vec::new(),
             requests_sanitized_total: 0,
             requests_sanitized: 0,
@@ -568,7 +609,7 @@ impl RequestStream {
     }
 
     /// Feed client bytes in, get origin bytes out.
-    pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), RewriteAnomaly> {
+    pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), PushError> {
         if matches!(self.state, State::Passthrough) {
             out.extend_from_slice(input);
             return Ok(());
@@ -622,7 +663,17 @@ impl RequestStream {
     }
 
     /// Rewrite one head and set up body framing.
-    fn handle_head(&mut self, head: &[u8], out: &mut Vec<u8>) -> Result<(), RewriteAnomaly> {
+    fn handle_head(&mut self, head: &[u8], out: &mut Vec<u8>) -> Result<(), PushError> {
+        // Every head, first or hundredth, on this connection. A one-shot check
+        // at connection setup would leave a reused keep-alive connection
+        // unlocked after its first authenticated request. Returning before any
+        // `out` mutation guarantees nothing partial went upstream.
+        if let Some(creds) = self.auth.as_deref() {
+            if !creds.check_head(head).is_granted() {
+                return Err(PushError::Unauthorized);
+            }
+        }
+
         let framing = match framing_of(head) {
             Ok(f) => f,
             Err(a) => return self.on_anomaly(a, head, out),
@@ -648,7 +699,7 @@ impl RequestStream {
     }
 
     /// Advance one chunked-body step. `Ok(false)` means "need more bytes".
-    fn step_chunked(&mut self, out: &mut Vec<u8>) -> Result<bool, RewriteAnomaly> {
+    fn step_chunked(&mut self, out: &mut Vec<u8>) -> Result<bool, PushError> {
         let phase = match self.state {
             State::Chunked(p) => p,
             _ => return Ok(false),
@@ -731,7 +782,7 @@ impl RequestStream {
         anomaly: RewriteAnomaly,
         verbatim: &[u8],
         out: &mut Vec<u8>,
-    ) -> Result<(), RewriteAnomaly> {
+    ) -> Result<(), PushError> {
         self.anomalies.push(anomaly);
 
         if self.policy == RewritePolicy::Fallback && anomaly.fallback_eligible() {
@@ -740,6 +791,6 @@ impl RequestStream {
             self.state = State::Passthrough;
             return Ok(());
         }
-        Err(anomaly)
+        Err(anomaly.into())
     }
 }

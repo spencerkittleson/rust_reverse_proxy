@@ -298,12 +298,8 @@ use rust_proxy::http_rewrite::{RequestStream, RewritePolicy};
 
 /// Feed `input` through a stream in `chunk`-sized pieces. Small chunk sizes
 /// exercise the split-read paths that blind relays never hit.
-fn drive(
-    policy: RewritePolicy,
-    input: &[u8],
-    chunk: usize,
-) -> Result<Vec<u8>, RewriteAnomaly> {
-    let mut stream = RequestStream::new(policy, 65536);
+fn drive(policy: RewritePolicy, input: &[u8], chunk: usize) -> Result<Vec<u8>, PushError> {
+    let mut stream = RequestStream::new(policy, 65536, None);
     let mut out = Vec::new();
     for piece in input.chunks(chunk) {
         stream.push(piece, &mut out)?;
@@ -422,7 +418,7 @@ fn transfer_encoding_plus_content_length_always_fails_closed() {
     for policy in [RewritePolicy::FailClosed, RewritePolicy::Fallback] {
         assert_eq!(
             drive(policy, input, 4096),
-            Err(RewriteAnomaly::FramingConflict),
+            Err(PushError::Anomaly(RewriteAnomaly::FramingConflict)),
             "framing conflict must fail closed under {policy:?}"
         );
     }
@@ -434,7 +430,7 @@ fn duplicate_conflicting_content_length_is_a_framing_conflict() {
                   Content-Length: 5\r\nContent-Length: 6\r\n\r\n";
     assert_eq!(
         drive(RewritePolicy::FailClosed, input, 4096),
-        Err(RewriteAnomaly::FramingConflict)
+        Err(PushError::Anomaly(RewriteAnomaly::FramingConflict))
     );
 }
 
@@ -452,7 +448,7 @@ fn oversized_head_fails_closed_by_default() {
     input.extend(std::iter::repeat_n(b'a', 70_000));
     input.extend_from_slice(b"\r\n\r\n");
 
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     let mut result = Ok(());
     for piece in input.chunks(4096) {
@@ -461,7 +457,10 @@ fn oversized_head_fails_closed_by_default() {
             break;
         }
     }
-    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+    assert_eq!(
+        result,
+        Err(PushError::Anomaly(RewriteAnomaly::HeadTooLarge))
+    );
 }
 
 #[test]
@@ -470,7 +469,7 @@ fn fallback_forwards_verbatim_and_switches_to_passthrough() {
     // untouched — that is the leak the flag buys — and parsing stops, because
     // the failed parse is the same parse that would find the next boundary.
     let input = b"!!! not http !!!\r\n\r\nany trailing bytes at all";
-    let mut stream = RequestStream::new(RewritePolicy::Fallback, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::Fallback, 65536, None);
     let mut out = Vec::new();
     stream.push(input, &mut out).expect("fallback should not error");
 
@@ -483,11 +482,11 @@ fn fallback_forwards_verbatim_and_switches_to_passthrough() {
 
 #[test]
 fn unparseable_fails_closed_by_default() {
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     assert_eq!(
         stream.push(b"!!! not http !!!\r\n\r\n", &mut out),
-        Err(RewriteAnomaly::Unparseable)
+        Err(PushError::Anomaly(RewriteAnomaly::Unparseable))
     );
     assert_eq!(stream.take_anomalies(), vec![RewriteAnomaly::Unparseable]);
 }
@@ -496,7 +495,7 @@ fn unparseable_fails_closed_by_default() {
 fn sanitized_request_count_tracks_successful_rewrites() {
     let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n\
                   GET http://e.example/two HTTP/1.1\r\nHost: e.example\r\n\r\n";
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(input, &mut out).unwrap();
     assert_eq!(stream.requests_sanitized(), 2);
@@ -508,7 +507,7 @@ const WS_REQUEST: &[u8] = b"GET http://e.example/ws HTTP/1.1\r\nHost: e.example\
 
 #[test]
 fn upgrade_request_arms_the_response_check_but_does_not_switch_yet() {
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
 
@@ -521,7 +520,7 @@ fn upgrade_request_arms_the_response_check_but_does_not_switch_yet() {
 
 #[test]
 fn accepted_upgrade_switches_to_passthrough() {
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
     stream.observe_response(b"HTTP/1.1 101 Switching Protocols\r\n");
@@ -537,7 +536,7 @@ fn accepted_upgrade_switches_to_passthrough() {
 fn declined_upgrade_keeps_parsing_and_still_rewrites_later_requests() {
     // This is why the response is consulted at all. Assuming success here would
     // leak absolute form on every later request on this connection.
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
     stream.observe_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -559,7 +558,7 @@ fn declined_upgrade_keeps_parsing_and_still_rewrites_later_requests() {
 #[test]
 fn response_observation_is_inert_without_an_upgrade_offer() {
     // The response path stays a blind relay for all normal traffic.
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream
         .push(
@@ -578,7 +577,7 @@ fn response_observation_is_inert_without_an_upgrade_offer() {
 
 #[test]
 fn split_status_line_is_still_detected() {
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
     for piece in b"HTTP/1.1 101 Switching Protocols\r\n".chunks(1) {
@@ -593,7 +592,7 @@ fn unbounded_chunk_size_line_fails_closed() {
     // capped, not buffered without bound.
     let mut input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n5;".to_vec();
     input.extend(std::iter::repeat_n(b'a', 70_000));
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     let mut result = Ok(());
     for piece in input.chunks(4096) {
@@ -602,7 +601,10 @@ fn unbounded_chunk_size_line_fails_closed() {
             break;
         }
     }
-    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+    assert_eq!(
+        result,
+        Err(PushError::Anomaly(RewriteAnomaly::HeadTooLarge))
+    );
 }
 
 #[test]
@@ -610,7 +612,7 @@ fn unbounded_trailer_block_fails_closed() {
     // A trailer section that never terminates must be capped.
     let mut input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: ".to_vec();
     input.extend(std::iter::repeat_n(b'a', 70_000));
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     let mut result = Ok(());
     for piece in input.chunks(4096) {
@@ -619,14 +621,17 @@ fn unbounded_trailer_block_fails_closed() {
             break;
         }
     }
-    assert_eq!(result, Err(RewriteAnomaly::HeadTooLarge));
+    assert_eq!(
+        result,
+        Err(PushError::Anomaly(RewriteAnomaly::HeadTooLarge))
+    );
 }
 
 #[test]
 fn reason_phrase_containing_101_does_not_switch_to_passthrough() {
     // A non-101 status whose reason phrase contains "101" must NOT flip to
     // passthrough — that would silently disable rewriting and leak.
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
     stream.observe_response(b"HTTP/1.1 500 Error 101 things\r\n");
@@ -648,9 +653,133 @@ fn reason_phrase_containing_101_does_not_switch_to_passthrough() {
 
 #[test]
 fn genuine_101_still_switches_to_passthrough() {
-    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536);
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, None);
     let mut out = Vec::new();
     stream.push(WS_REQUEST, &mut out).unwrap();
     stream.observe_response(b"HTTP/1.1 101 Switching Protocols\r\n");
     assert!(stream.is_passthrough());
+}
+
+use rust_proxy::auth::Credentials;
+use rust_proxy::http_rewrite::PushError;
+use std::sync::Arc;
+
+fn creds_for(text: &str) -> Option<Arc<Credentials>> {
+    Some(Arc::new(Credentials::parse_file_contents(text).unwrap()))
+}
+
+/// Feed `input` through an authenticating stream in `chunk`-sized pieces.
+fn drive_auth(
+    policy: RewritePolicy,
+    auth: Option<Arc<Credentials>>,
+    input: &[u8],
+    chunk: usize,
+) -> Result<Vec<u8>, PushError> {
+    let mut stream = RequestStream::new(policy, 65536, auth);
+    let mut out = Vec::new();
+    for piece in input.chunks(chunk) {
+        stream.push(piece, &mut out)?;
+    }
+    Ok(out)
+}
+
+#[test]
+fn a_reused_connection_is_reauthenticated_on_every_request() {
+    // The bypass this exists to prevent: request 1 carries a credential,
+    // request 2 does not, and must not reach the origin.
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\
+                  Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n\
+                  GET http://e.example/two HTTP/1.1\r\nHost: e.example\r\n\r\n";
+
+    for chunk in [1usize, 7, 64, 4096] {
+        let result = drive_auth(
+            RewritePolicy::FailClosed,
+            creds_for("user:secret"),
+            input,
+            chunk,
+        );
+        assert_eq!(
+            result,
+            Err(PushError::Unauthorized),
+            "request 2 slipped through at chunk size {chunk}"
+        );
+    }
+}
+
+#[test]
+fn every_request_carrying_the_credential_is_forwarded() {
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\
+                  Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n\
+                  GET http://e.example/two HTTP/1.1\r\nHost: e.example\r\n\
+                  Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\n";
+    let expected = b"GET /one HTTP/1.1\r\nHost: e.example\r\n\r\n\
+                     GET /two HTTP/1.1\r\nHost: e.example\r\n\r\n";
+
+    for chunk in [1usize, 7, 64, 4096] {
+        let got = drive_auth(
+            RewritePolicy::FailClosed,
+            creds_for("user:secret"),
+            input,
+            chunk,
+        )
+        .unwrap();
+        assert_eq!(got, expected.to_vec(), "failed at chunk size {chunk}");
+    }
+}
+
+#[test]
+fn unauthorized_is_never_eligible_for_rewrite_fallback() {
+    // --rewrite-fallback buys a rewrite leak, never an access-control bypass.
+    // This is the test that matters if anyone touches the error plumbing.
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    for policy in [RewritePolicy::FailClosed, RewritePolicy::Fallback] {
+        assert_eq!(
+            drive_auth(policy, creds_for("user:secret"), input, 4096),
+            Err(PushError::Unauthorized),
+            "policy {policy:?} must not forward an unauthenticated request"
+        );
+    }
+}
+
+#[test]
+fn an_unauthorized_head_produces_no_output_bytes() {
+    // Nothing may be appended to `out` before the credential is accepted,
+    // otherwise a partial head would already have gone upstream.
+    let mut stream = RequestStream::new(RewritePolicy::FailClosed, 65536, creds_for("user:secret"));
+    let mut out = Vec::new();
+    let err = stream
+        .push(
+            b"GET http://e.example/x HTTP/1.1\r\nHost: e.example\r\n\r\n",
+            &mut out,
+        )
+        .unwrap_err();
+    assert_eq!(err, PushError::Unauthorized);
+    assert!(out.is_empty(), "leaked {:?}", String::from_utf8_lossy(&out));
+    assert_eq!(stream.requests_sanitized(), 0);
+}
+
+#[test]
+fn no_credential_configured_means_no_check() {
+    let input = b"GET http://e.example/one HTTP/1.1\r\nHost: e.example\r\n\r\n";
+    let got = drive_auth(RewritePolicy::FailClosed, None, input, 4096).unwrap();
+    assert_eq!(got, b"GET /one HTTP/1.1\r\nHost: e.example\r\n\r\n".to_vec());
+}
+
+#[test]
+fn an_authenticated_body_still_streams() {
+    // The check runs on heads only; a POST body must pass through untouched.
+    let input = b"POST http://e.example/x HTTP/1.1\r\nHost: e.example\r\n\
+                  Content-Length: 5\r\n\
+                  Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n\r\nhello";
+    let expected = b"POST /x HTTP/1.1\r\nHost: e.example\r\nContent-Length: 5\r\n\r\nhello";
+    for chunk in [1usize, 7, 4096] {
+        let got = drive_auth(
+            RewritePolicy::FailClosed,
+            creds_for("user:secret"),
+            input,
+            chunk,
+        )
+        .unwrap();
+        assert_eq!(got, expected.to_vec(), "failed at chunk size {chunk}");
+    }
 }
